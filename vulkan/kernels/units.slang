@@ -133,8 +133,9 @@ void bytes2(uint w, inout float q[MAXU], int o) {
 void Dec_run<let F : int>(uint8_t* row, int u, inout float q[MAXU], out float4 sc) {
     if (F == T_Q2_0) {
         uint8_t* b = row + (u >> 2) * 18;
-        uint16_t* p = (uint16_t*)(b + 2 + 4 * (u & 3));
-        const uint a = uint(p[0]), c = uint(p[1]);
+        // the unit's two halfwords as one 2 x 16-bit load (2-byte aligned): Mesa issues two narrow loads otherwise
+        const uint16_t2 ac = loadAligned<2>((uint16_t2*)(b + 2 + 4 * (u & 3)));
+        const uint a = uint(ac.x), c = uint(ac.y);
         [ForceUnroll]
         for (int j = 0; j < 8; ++j) {
             q[j] = float(a & (3u << (2 * j)));

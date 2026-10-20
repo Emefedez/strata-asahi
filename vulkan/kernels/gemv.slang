@@ -24,7 +24,7 @@ struct GemvPush {
 
 [vk::constant_id(0)] const int NTOK = 1;         // tokens of the window (1..8): the token loops are specialised
 // a bench probe (function constant 9): 1 = tokens past the first reuse token 0's x (no load; wrong values),
-// 2 = tokens past the first skip the combine (wrong values)
+// 2 = tokens past the first skip the combine, 4 = no x loads, 5 = no weight loads or decode (all wrong values)
 [vk::constant_id(9)] const int GEMV_PROBE = 0;
 
 groupshared float g_red[256];   // K-split partials: KS * RS * RG * NR * 8 <= 128 floats for every shape below
@@ -69,10 +69,20 @@ void gemv<let F : int, let LPR : int, let NR : int, let SG : int, let KS : int>(
             float q[NR][MAXU];
             float4 sc[NR];
             [ForceUnroll]
-            for (int r = 0; r < NR; ++r) Dec_run<F>(rp[r], u, q[r], sc[r]);
+            for (int r = 0; r < NR; ++r) {
+                if (GEMV_PROBE == 5) {   // bench probe: no weight loads or decode (wrong values)
+                    [ForceUnroll] for (int j = 0; j < MAXU; ++j) q[r][j] = float(j + u);
+                    sc[r] = float4(1, 1, 0, 0);
+                } else
+                    Dec_run<F>(rp[r], u, q[r], sc[r]);
+            }
             float xs[MAXU], xsum[2];
+            if (GEMV_PROBE == 4) {   // bench probe: no x loads (constant x; wrong values)
+                [ForceUnroll] for (int j = 0; j < MAXU; ++j) xs[j] = float(j);
+                xsum[0] = xsum[1] = 1.0f;
+            }
             for (int t = 0; t < NTOK; ++t) {
-                if (GEMV_PROBE != 1 || t == 0) X_load<F>(pc.xp + t * int(a.x_stride), pc.s16 + t * s16n, u, xs, xsum);
+                if ((GEMV_PROBE != 1 || t == 0) && GEMV_PROBE != 4) X_load<F>(pc.xp + t * int(a.x_stride), pc.s16 + t * s16n, u, xs, xsum);
                 if (GEMV_PROBE != 2 || t == 0)
                     [ForceUnroll]
                     for (int r = 0; r < NR; ++r) acc[r][t] += unit_combine(UNIT, q[r], sc[r], xs, xsum);
