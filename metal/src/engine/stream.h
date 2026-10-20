@@ -92,6 +92,12 @@ private:
     uint8_t* standalone_region(uint64_t bytes);   // the prompt's buffers as their own allocation, when no region of the arena's slots takes them
 
     int fd_ = -1;
+    // Linux: O_DIRECT descriptors of the GGUF and the contiguous copy for the expert reads (-1: the buffered one);
+    // macOS reads with F_NOCACHE on fd_ / cfd_
+    int dfd_ = -1, dcfd_ = -1;
+    // read [off, off + n) into dst; before / after: the bytes around dst that may be overwritten (O_DIRECT edges)
+    static bool pread_x(int fd, int dfd, uint8_t* dst, uint64_t n, uint64_t off, uint64_t before, uint64_t after);
+    uint64_t slot_bytes(int s) const;
     // <gguf>.experts (metal/tools/stream_experts.py): each expert's gate, up and down rows together, read with one
     // request (cfd_ >= 0); else the GGUF's three slices.  STRATA_METAL_CONTIG=0: the GGUF always.
     int cfd_ = -1;

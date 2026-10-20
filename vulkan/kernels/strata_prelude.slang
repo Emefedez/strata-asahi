@@ -10,3 +10,14 @@
 
 // The simdgroup is a 32-lane subgroup on Apple GPUs.
 static const int SIMD = 32;
+
+// Metal's simd_shuffle_xor / simd_prefix_exclusive_sum on the 32-lane subgroup.
+float shfl_xor(float v, uint m) { return WaveReadLaneAt(v, WaveGetLaneIndex() ^ m); }
+int shfl_xor(int v, uint m) { return WaveReadLaneAt(v, WaveGetLaneIndex() ^ m); }
+uint shfl_xor(uint v, uint m) { return WaveReadLaneAt(v, WaveGetLaneIndex() ^ m); }
+int simd_prefix_exclusive_sum(int v) { return WavePrefixSum(v); }
+
+// The flat threadgroup size (Metal's threads_per_threadgroup for a 1-D group).
+static const int TG_N = TG_X * TG_Y * TG_Z;
+static const float FLT_MAX = 3.402823466e+38f;
+#define INFINITY asfloat(0x7f800000u)

@@ -63,3 +63,70 @@ foreach(t ${STRATA_VK_TESTS})
   target_link_libraries(${t} PRIVATE mtl_rt)
   set_target_properties(${t} PROPERTIES BUILD_RPATH "${SLANG_DIR}/lib")
 endforeach()
+
+# ---- the engine (strata) ------------------------------------------------------------------------------------------
+# metal/CMakeLists.txt's engine on Vulkan: the shared host sources from ../src UNCHANGED (metal/include/metal_compat
+# gives them the CUDA runtime names, as on the Mac), the device runtime src/gpu/runtime_vk.cpp, and the Metal engine's
+# kernel host code metal/src/engine/*.cpp over mtl_rt_vk.cpp.  The build keeps STRATA_GPU_METAL: the host code's Metal
+# paths are the unified-memory design, which is this one too.
+#   cmake -S vulkan -B build-vulkan -G Ninja -DSTRATA_ENABLE_VULKAN=ON -DSTRATA_GGML_DIR=<llama.cpp at 3cf03257>
+option(STRATA_ENABLE_VULKAN "Build the engine (strata) for Vulkan" OFF)
+set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout at the pinned commit")
+if(NOT STRATA_ENABLE_VULKAN)
+  return()
+endif()
+if(NOT EXISTS "${STRATA_GGML_DIR}/ggml/CMakeLists.txt")
+  message(FATAL_ERROR "STRATA_GGML_DIR='${STRATA_GGML_DIR}' is not a llama.cpp checkout")
+endif()
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(GGML_STATIC ON CACHE BOOL "" FORCE)
+set(GGML_METAL OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+
+add_library(strata_gpu_vulkan STATIC src/gpu/runtime_vk.cpp)
+target_include_directories(strata_gpu_vulkan BEFORE PUBLIC ${METAL_DIR}/include/metal_compat ${METAL_DIR}/include
+                           ${STRATA_ROOT}/include)
+target_compile_definitions(strata_gpu_vulkan PUBLIC STRATA_GPU_METAL=1 STRATA_GPU_VULKAN=1)
+
+set(S ${STRATA_ROOT}/src)
+set(STRATA_VK_HOST_SOURCES
+  ${S}/core/device.cu ${S}/core/pinned.cu ${S}/platform/memory.cpp ${S}/core/graph.cpp ${S}/core/weights.cpp ${S}/core/layout.cpp
+  ${S}/core/layer.cpp ${S}/core/session.cpp ${S}/core/expert_source.cpp ${S}/core/remote_experts.cpp ${S}/core/expert_cache.cpp
+  ${S}/core/native_head.cpp ${S}/core/native_dense.cpp ${S}/core/verify.cpp ${S}/core/mtp.cpp
+  ${S}/core/conversation_snapshot.cpp ${S}/core/conversation_state.cpp ${S}/core/conversation_memory.cpp
+  ${S}/core/peer_experts.cpp ${S}/core/arch_defaults.cpp ${S}/core/vmm.cpp ${S}/core/conversation_file.cpp
+  ${S}/kernels/ngram.cpp ${S}/ngram/ple_reader.cpp ${S}/platform/direct_file.cpp
+  ${S}/prefill/prefill.cpp
+  ${S}/spec/suffix_drafter.cpp ${S}/spec/controller.cpp ${S}/spec/draft_policy.cpp ${S}/spec/draft_source.cpp
+  ${S}/kernels/cpu/pool.cpp ${S}/kernels/cpu/expert_layout.cpp ${S}/kernels/cpu/native_expert.cpp
+  ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp)
+set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu PROPERTIES LANGUAGE CXX)
+
+add_library(strata_vk_host STATIC ${STRATA_VK_HOST_SOURCES})
+target_include_directories(strata_vk_host PUBLIC ${STRATA_ROOT}/include ${S}/core ${STRATA_ROOT}/third_party/ggml
+                           ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src ${STRATA_GGML_DIR}/ggml/src/ggml-cpu)
+target_compile_definitions(strata_vk_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_VERSION="0.1.46-vulkan")
+target_compile_options(strata_vk_host PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
+target_link_libraries(strata_vk_host PUBLIC strata_gpu_vulkan ggml-cpu ggml-base)
+
+# The Metal engine's kernel host code, unchanged where it can be (the macOS-only calls have Linux branches in it).
+file(GLOB STRATA_VK_ENGINE_SOURCES CONFIGURE_DEPENDS ${METAL_DIR}/src/engine/*.cpp)
+list(APPEND STRATA_VK_ENGINE_SOURCES src/engine_stubs_linux.cpp)
+add_library(strata_vk_kernels STATIC ${STRATA_VK_ENGINE_SOURCES})
+target_include_directories(strata_vk_kernels BEFORE PRIVATE src)
+target_include_directories(strata_vk_kernels PRIVATE ${METAL_DIR}/src ${STRATA_ROOT}/third_party/ggml)
+target_compile_definitions(strata_vk_kernels PRIVATE
+  STRATA_METAL_ENGINE_KERNELS_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/kernels/engine"
+  STRATA_METAL_DATA_DEFAULT="${STRATA_ROOT}/data")
+target_link_libraries(strata_vk_kernels PUBLIC strata_vk_host mtl_rt)
+
+add_executable(strata ${S}/program/generate.cpp)
+target_link_libraries(strata PRIVATE strata_vk_kernels strata_vk_host strata_vk_kernels)
+set_target_properties(strata PROPERTIES BUILD_RPATH "${SLANG_DIR}/lib" INSTALL_RPATH "${SLANG_DIR}/lib")

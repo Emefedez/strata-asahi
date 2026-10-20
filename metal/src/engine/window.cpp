@@ -16,6 +16,7 @@
 #include "resource_path.h"
 #include "ref_quant.h"
 #include "arena_budget.h"
+#include "sys_mem.h"
 #include "stream.h"
 #include "../../tests/coop_probe.h"
 
@@ -39,8 +40,6 @@
 #include <memory>
 #include <string>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
-#include <mach/mach.h>
 #include <thread>
 #include <vector>
 
@@ -1123,21 +1122,7 @@ double Window::run_ds(Cached& c) {
 
 namespace {
 Window* g_stream_window = nullptr;
-// What the process holds now, all of it (task_info TASK_VM_INFO): phys_footprint is its anonymous + wired + compressed memory
-// (not the clean file pages it only maps), resident_size is the RSS (those pages too).  Bytes; 0 when the call fails.
-struct ProcMem {
-    double footprint = 0, rss = 0;
-};
-ProcMem proc_mem() {
-    task_vm_info_data_t ti;
-    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    ProcMem r;
-    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &ti, &cnt) == KERN_SUCCESS) {
-        r.footprint = (double) ti.phys_footprint;
-        r.rss = (double) ti.resident_size;
-    }
-    return r;
-}
+// What the process holds now, all of it: proc_mem() (sys_mem.h).
 void stream_atexit() {
     if (g_stream_window) g_stream_window->stream_report(stderr);
 }
@@ -1148,9 +1133,7 @@ void stream_atexit() {
 // froze with an 89 GB arena and 7 GB left beside a 50 GB n-gram table read through the file cache; arena_budget.h);
 // STRATA_METAL_ARENA_GB sets it.
 bool Window::stream_arena(std::string& err) {
-    uint64_t phys = 0;
-    size_t len = sizeof phys;
-    sysctlbyname("hw.memsize", &phys, &len, nullptr, 0);
+    const uint64_t phys = phys_ram();
     const double gb = 1e9;
     if (!(std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS") && std::string(std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS")) == "1")) {
         const uint64_t g = strata::gpu::purge_device_allocations(32u << 20);
@@ -1160,27 +1143,14 @@ bool Window::stream_arena(std::string& err) {
     const double used = (double) cx_->allocated();
     // what macOS gives now without paging anything out (arena_avail: free, purgeable, the clean file cache; not other
     // programs' inactive memory, freed only by compressing or swapping it)
-    auto avail_now = [&]() -> double {
-        vm_statistics64_data_t vs;
-        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
-        if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) == KERN_SUCCESS) {
-            const double pg = (double) vm_page_size;
-            return arena_avail(vs.free_count * pg, vs.purgeable_count * pg, vs.inactive_count * pg, vs.speculative_count * pg,
-                               vs.external_page_count * pg);
-        }
-        return (double) phys - (double) cx_->allocated();
-    };
+    auto avail_now = [&]() -> double { return mem_available((double) phys - (double) cx_->allocated()); };
     ArenaMem am;   // arena_budget.h: the rule, testable
     am.phys = (double) phys;
     am.working_set = (double) cx_->recommended_working_set();
     am.allocated = used;
     const ProcMem pm0 = proc_mem();   // everything the process holds, not only the Metal buffers (the old 67% rule missed it)
     am.proc_footprint = pm0.footprint;
-    {   // the file cache macOS keeps before it compresses anonymous memory (a 4-byte count of pages, read into a zeroed 8)
-        unsigned long long pages = 0;
-        size_t pl = sizeof pages;
-        if (sysctlbyname("vm.vm_page_filecache_min", &pages, &pl, nullptr, 0) == 0) am.filecache_min = (double) pages * (double) vm_page_size;
-    }
+    am.filecache_min = filecache_min();   // the file cache macOS keeps before it compresses anonymous memory
     am.available = avail_now();
     if (ss_ && ss_->ple.table && ss_->ple.table->mode() == strata::kernels::PleIo::Mmap)
         am.ple_mapped = (double) ss_->ple.table->rows() * 192.0;   // a row is at most 192 bytes (Q8_0 + its scale)
@@ -2047,9 +2017,7 @@ bool Window::prompt_gemm_init(std::string& err) {
     // streams each expert fewer times. M5 Max, UD-Q5, warm: 1024 -> 700 tok/s at 4K, 2048 -> 920, 4096 -> 1,100 (32K the
     // same). The longer chunk's buffers (4.3 GB) come out of the arena only while a prompt runs, so it is the default on a
     // big Mac; a small one keeps 1024 (the buffers would cost it cache).
-    uint64_t phys = 0;
-    size_t plen = sizeof phys;
-    sysctlbyname("hw.memsize", &phys, &plen, nullptr, 0);
+    const uint64_t phys = phys_ram();
     const int stream_chunk = phys >= (96ull << 30) ? 4096 : 1024;
     const int C = std::max(64, ec ? std::atoi(ec) : (stream_ ? stream_chunk : 2048)) / 64 * 64;
     auto pg = std::make_unique<PromptGemm>();

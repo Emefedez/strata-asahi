@@ -4,7 +4,7 @@
 #include "ref_quant.h"
 #include "arena_budget.h"
 
-#include <sys/sysctl.h>
+#include "sys_mem.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -41,9 +41,7 @@ bool ExpertStream::wanted(const gguf::File& f, const mtl::Context& cx) {
     uint64_t all = 0;
     for (const auto& kv : f.tensors)
         if (kv.first != "per_layer_token_embd.weight") all += kv.second.bytes;
-    uint64_t phys = 0;
-    size_t len = sizeof phys;
-    sysctlbyname("hw.memsize", &phys, &len, nullptr, 0);
+    const uint64_t phys = phys_ram();
     return !resident_fits((double) phys, (double) cx.recommended_working_set(), (double) all, 12.0 * (1ull << 30));
 }
 
@@ -55,13 +53,22 @@ ExpertStream::~ExpertStream() {
     cv_.notify_all();
     for (auto& t : io_) t.join();
     if (fd_ >= 0) ::close(fd_);
+    if (dfd_ >= 0) ::close(dfd_);
+    if (dcfd_ >= 0) ::close(dcfd_);
 }
 
 bool ExpertStream::open(const gguf::File& f, std::string& err) {
     fd_ = ::open(f.path.c_str(), O_RDONLY);
     if (fd_ < 0) { err = "metal stream: cannot open " + f.path; return false; }
+#if defined(__APPLE__)
     fcntl(fd_, F_NOCACHE, 1);
     fcntl(fd_, F_RDAHEAD, 0);
+#else
+    // Linux has no F_NOCACHE: the expert reads go through an O_DIRECT descriptor (no page cache beside the arena),
+    // the dense load and the checks through fd_
+    posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+    if (env_int("STRATA_VK_DIRECT", 1) != 0) dfd_ = ::open(f.path.c_str(), O_RDONLY | O_DIRECT);
+#endif
     lay_.resize(NL);
     for (int l = 0; l < NL; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
@@ -108,8 +115,13 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
             }
         }
         if (ok) {
+#if defined(__APPLE__)
             fcntl(cfd, F_NOCACHE, 1);
             fcntl(cfd, F_RDAHEAD, 0);
+#else
+            posix_fadvise(cfd, 0, 0, POSIX_FADV_RANDOM);
+            if (env_int("STRATA_VK_DIRECT", 1) != 0) dcfd_ = ::open(cp.c_str(), O_RDONLY | O_DIRECT);
+#endif
             cfd_ = cfd;
             coff_ = off;
             std::fprintf(stderr, "strata metal stream: experts read from %s (one request per expert)\n", cp.c_str());
@@ -162,6 +174,57 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
     fake_ = env_int("STRATA_METAL_STREAM_FAKE", 0) != 0;
     return true;
 }
+
+// O_DIRECT (Linux) wants 4096-aligned file offsets and lengths (btrfs; the memory may sit anywhere, measured on the
+// M1 Max's NVMe).  An expert of the contiguous copy is 1,382,400 bytes for Q2_0, so every other one starts 2048 bytes
+// into a block.  The aligned superset of [off, off + n) is read straight into the slot where the bytes around dst may
+// be overwritten (`before` / `after`: the slot's own bytes - the other pieces of the same expert, which get the same
+// file bytes - or its slack past the expert); an edge that would reach outside goes through a 4 KiB bounce.
+bool ExpertStream::pread_x(int fd, int dfd, uint8_t* dst, uint64_t n, uint64_t off, uint64_t before, uint64_t after) {
+    if (dfd < 0) {
+        while (n > 0) {
+            const ssize_t r = ::pread(fd, dst, (size_t) std::min<uint64_t>(n, 64ull << 20), (off_t) off);
+            if (r <= 0) return false;
+            dst += r; off += (uint64_t) r; n -= (uint64_t) r;
+        }
+        return true;
+    }
+    constexpr uint64_t A = 4096;
+    alignas(A) thread_local static uint8_t bounce[A];
+    auto edge = [&](uint64_t blk, uint64_t from, uint64_t len, uint8_t* to) {   // bytes [from, from + len) of block blk
+        const ssize_t r = ::pread(dfd, bounce, A, (off_t) blk);
+        if (r < (ssize_t) (from - blk + len)) return false;
+        std::memcpy(to, bounce + (from - blk), (size_t) len);
+        return true;
+    };
+    if (const uint64_t head = off % A; head > before) {
+        const uint64_t k = std::min<uint64_t>(n, A - head);
+        if (!edge(off - head, off, k, dst)) return false;
+        dst += k; off += k; n -= k; before = 0;
+        if (n == 0) return true;
+    }
+    uint64_t end = off + n;
+    if (const uint64_t tail = (A - end % A) % A; tail > after) {
+        const uint64_t blk = end - end % A;
+        if (blk >= off) {   // the last, partial block through the bounce (blk == off: it is all there is)
+            if (!edge(blk, blk, end - blk, dst + (blk - off))) return false;
+            end = blk;
+            if (end == off) return true;
+        }
+    }
+    const uint64_t lo = off - off % A, hi = (end + A - 1) / A * A;
+    uint8_t* d = dst - (off - lo);
+    uint64_t got = 0;
+    while (lo + got < end) {
+        const ssize_t r = ::pread(dfd, d + got, (size_t) std::min<uint64_t>(hi - lo - got, 64ull << 20), (off_t) (lo + got));
+        if (r <= 0) return false;
+        got += (uint64_t) r;
+        if (r % A) break;   // the file's end
+    }
+    return lo + got >= end;
+}
+
+uint64_t ExpertStream::slot_bytes(int s) const { return cls_[(size_t) cls_of(s)].pages * PAGE; }
 
 bool ExpertStream::read(void* dst, uint64_t len, uint64_t off) const {
     uint8_t* p = (uint8_t*) dst;
@@ -275,15 +338,9 @@ void ExpertStream::read_part(int s, int l, int e, int part) {
         const uint64_t len = x.gs + x.us + x.ds, src = coff_[(size_t) l] + (uint64_t) e * len;
         const uint64_t a = len * (uint64_t) part / (uint64_t) split_ / 4096 * 4096;
         const uint64_t b = part + 1 == split_ ? len : len * (uint64_t) (part + 1) / (uint64_t) split_ / 4096 * 4096;
-        uint8_t* p = host_[(size_t) s] + a;
-        uint64_t n = b - a, o = src + a;
-        while (n > 0) {
-            const ssize_t r = ::pread(cfd_, p, (size_t) n, (off_t) o);
-            if (r <= 0) {
-                std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
-                std::exit(6);
-            }
-            p += r; o += (uint64_t) r; n -= (uint64_t) r;
+        if (!pread_x(cfd_, dcfd_, host_[(size_t) s] + a, b - a, src + a, a, slot_bytes(s) - b)) {
+            std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
+            std::exit(6);
         }
         bytes_read_ += b - a;
         return;
@@ -294,7 +351,10 @@ void ExpertStream::read_part(int s, int l, int e, int part) {
     const uint64_t dst = k == 0 ? 0 : (k == 1 ? x.gs : x.gs + x.us);
     const uint64_t a = len * (uint64_t) p / (uint64_t) split_ / 4096 * 4096;
     const uint64_t b = p + 1 == split_ ? len : len * (uint64_t) (p + 1) / (uint64_t) split_ / 4096 * 4096;
-    if (b > a && !read(host_[(size_t) s] + dst + a, b - a, src + a)) {
+    // around the piece: its own slice only (the slot's other slices come from elsewhere in the file), and past the down
+    // slice the slot's slack
+    const uint64_t after = b < len ? len - b : (k == 2 ? slot_bytes(s) - (dst + b) : 0);
+    if (b > a && !pread_x(fd_, dfd_, host_[(size_t) s] + dst + a, b - a, src + a, a, after)) {
         std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
         std::exit(6);
     }
@@ -546,9 +606,7 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
     // shrink the file cache.  STRATA_METAL_WIRE_ARENA=0/1; the default is on for a Mac of 64 GB or more (the M4 32 GB was measured
     // unwired).  Not when the fill stopped early for lack of memory (the unused slots would be wired too).
     {
-        uint64_t phys = 0;
-        size_t plen = sizeof phys;
-        sysctlbyname("hw.memsize", &phys, &plen, nullptr, 0);
+        const uint64_t phys = phys_ram();
         const char* we = std::getenv("STRATA_METAL_WIRE_ARENA");
         const bool want = we && *we ? std::atoi(we) != 0 : (double) phys >= kBigMac;
         if (want && !stopped) {
