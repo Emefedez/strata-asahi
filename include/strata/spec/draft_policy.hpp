@@ -42,6 +42,17 @@ public:
     int chain(int t_mtp, double p_mtp, int k_avail, int match) const;
     /// After a chained round: the MTP window's size, the chained tokens, the window's accepted drafts, its time.
     void observe_chain(int t_mtp, int k, int accepted, int match, double round_ms);
+    /// --spec-sched cost: the MTP window's size from its drafts' own probabilities, the confidence-scheduled
+    /// verification of DeepSeek's DeepInfer (schedule_mtp_varlen) for one sequence.  Draft k is kept in the window
+    /// only while E(t) / cost(t) grows: E(t) = 1 + sum_{k < t} prod_{i <= k} c(p_i), with c(p) the measured acceptance
+    /// of drafts whose probability fell in p's decile (decayed counts; prior: p itself, worth kPriorN windows) - the
+    /// draft layer has no trained confidence head, so its probability is calibrated online - and cost(t) the measured
+    /// round time of a t-token window.  When the experts stream from the SSD, a wider window reads more of them, and
+    /// cost(t) carries that.  Returns 1 .. n_drafts + 1.
+    int choose_mtp(const float* dprob, int n_drafts) const;
+    /// After an MTP round of `t` tokens whose drafts had the probabilities `dprob` (as passed to choose_mtp).
+    void observe_mtp(const float* dprob, int t, int accepted);
+    double accept_rate(float p) const;     // calibrated c(p)
     double chain_rate(int match) const;
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
@@ -59,6 +70,7 @@ private:
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
     std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
+    std::array<double, 10> pok_{}, pn_{};                  // MTP drafts by probability decile: accepted / tested, decayed
 };
 
 }  // namespace strata::spec

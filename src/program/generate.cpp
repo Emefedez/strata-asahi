@@ -691,6 +691,7 @@ struct Options {
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
+    int spec_sched = 0;   // --spec-sched cost: the MTP window's size by expected tokens per ms (DraftPolicy::choose_mtp)
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
@@ -922,6 +923,11 @@ void usage() {
                  "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
                  "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
                  "                       (setup writes 0.5; --calibrate measures it on this PC, see docs/DETAILS.md)\n"
+                 "  --spec-sched cost|off  opt-in: the MTP window's size per round by expected tokens per ms: each draft is\n"
+                 "                       kept while the cumulative product of its calibrated acceptance (the draft layer's\n"
+                 "                       probability, measured against what verification accepted) beats the measured cost\n"
+                 "                       of a wider window (DeepSeek DeepInfer's confidence-scheduled verification).  Off by\n"
+                 "                       default; it only chooses which drafts to verify, the output is unchanged\n"
                  "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
                  "                       them (the window grows to at most 8; default 0 = off)\n"
                  "  --lookup-chain-min M  the shortest context match --lookup-chain extends on (default 3)\n"
@@ -2587,6 +2593,12 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+        else if (a == "--spec-sched") {
+            const std::string v = next("--spec-sched");
+            if (v == "cost") o.spec_sched = 1;
+            else if (v == "off") o.spec_sched = 0;
+            else { std::fprintf(stderr, "--spec-sched: cost or off\n"); return 2; }
+        }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -14627,7 +14639,12 @@ int main(int argc, char** argv) {
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
+                std::array<float, 8> dp_win{};   // --spec-sched: the window's draft probabilities, for observe_mtp
+                if (use_mtp && o.spec_sched == 1 && !first_window) {
+                    int nd = 0;
+                    while (nd < S_mtp - 1 && nd < 7 && dprob[(size_t) nd] > 0.0f) { dp_win[(size_t) nd] = dprob[(size_t) nd]; ++nd; }
+                    T = policy.choose_mtp(dp_win.data(), nd);
+                } else if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
@@ -14909,6 +14926,7 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                if (use_mtp && o.spec_sched == 1) std::fill(dprob.begin(), dprob.end(), 0.0f);   // past an early stop: no draft
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -14931,9 +14949,13 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (timed_round && !eos && chain_n == 0)
+                // --spec-sched: a size's first round compiles its kernels' specialisations (0.5 s on Asahi): not a cost
+                static std::array<bool, 9> sched_seen{};
+                const bool warm = o.spec_sched != 1 || std::exchange(sched_seen[(size_t) std::clamp(T, 0, 8)], true);
+                if (timed_round && !eos && chain_n == 0 && warm)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                if (use_mtp && o.spec_sched == 1 && timed_round && !from_sfx && chain_n == 0) policy.observe_mtp(dp_win.data(), T, a);
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
                     policy.observe_chain(T_mtp, chain_n, a, cm,
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
@@ -16132,8 +16154,13 @@ int main(int argc, char** argv) {
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
-            int T = S_mtp;
-            if (use_mtp && o.spec_min_p > 0.0) {
+            int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires (as --serve)
+            std::array<float, 8> dp_win{};   // --spec-sched: the window's draft probabilities, for observe_mtp
+            if (use_mtp && o.spec_sched == 1 && !first_window) {
+                int nd = 0;
+                while (nd < S_mtp - 1 && nd < 7 && dprob[(size_t) nd] > 0.0f) { dp_win[(size_t) nd] = dprob[(size_t) nd]; ++nd; }
+                T = policy.choose_mtp(dp_win.data(), nd);
+            } else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
@@ -16267,6 +16294,7 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
+            if (use_mtp && o.spec_sched == 1) std::fill(dprob.begin(), dprob.end(), 0.0f);   // past an early stop: no draft
             const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
             if (adapt_thr.joinable()) adapt_thr.join();
@@ -16279,7 +16307,11 @@ int main(int argc, char** argv) {
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
-            if (timed_round && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
+            // --spec-sched: a size's first round compiles its kernels' specialisations (0.5 s on Asahi): not a cost
+            static std::array<bool, 9> sched_seen{};
+            const bool warm = o.spec_sched != 1 || std::exchange(sched_seen[(size_t) std::clamp(T, 0, 8)], true);
+            if (timed_round && chain_n == 0 && warm) policy.observe(from_sfx, T, a, sfx_match, round_ms);
+            if (use_mtp && o.spec_sched == 1 && timed_round && !from_sfx && chain_n == 0) policy.observe_mtp(dp_win.data(), T, a);
             else if (timed_round) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,

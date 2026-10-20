@@ -107,6 +107,36 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     }
 }
 
+double DraftPolicy::accept_rate(float p) const {
+    const int b = std::clamp((int) (p * 10.0f), 0, 9);
+    const double prior = std::clamp((double) p, 0.0, 1.0);
+    return (pok_[b] + kPriorN * prior) / (pn_[b] + kPriorN);
+}
+
+int DraftPolicy::choose_mtp(const float* dprob, int n_drafts) const {
+    n_drafts = std::clamp(n_drafts, 0, max_t_ - 1);
+    double e = 1.0, cum = 1.0, best = 1.0 / cost_ms(1);
+    int best_t = 1, probe = 0;
+    for (int k = 1; k <= n_drafts; ++k) {
+        cum *= accept_rate(dprob[k - 1]);
+        e += cum;
+        const double r = e / cost_ms(k + 1);
+        if (r > best * (1.0 + margin_)) { best = r; best_t = k + 1; }
+        // a size whose cost is only guessed is tried a few times when its drafts look likely to hold
+        if (cum >= 0.5 && (cost_n_[k + 1] < kProbes || stale(k + 1))) probe = k + 1;
+    }
+    return std::max(best_t, probe);
+}
+
+void DraftPolicy::observe_mtp(const float* dprob, int t, int accepted) {
+    // draft i was tested only if every draft before it held; it held if i < accepted
+    for (int i = 0; i < t - 1 && i <= accepted; ++i) {
+        const int b = std::clamp((int) (dprob[i] * 10.0f), 0, 9);
+        pok_[b] = kDecay * pok_[b] + (i < accepted ? 1.0 : 0.0);
+        pn_[b] = kDecay * pn_[b] + 1.0;
+    }
+}
+
 double DraftPolicy::chain_rate(int match) const {
     // prior: a chained draft is a lookup continuing the MTP's drafts - weaker evidence than a plain match of that length
     constexpr double kChainPrior[kBuckets] = {0.45, 0.65, 0.8, 0.9};
