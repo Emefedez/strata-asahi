@@ -349,6 +349,13 @@ Context::Context() : impl_(new Impl) {
     opt_int(slang::CompilerOptionName::GLSLForceScalarLayout, 1);
     opt_int(slang::CompilerOptionName::VulkanUseEntryPointName, 1);
     opt_int(slang::CompilerOptionName::Optimization, SLANG_OPTIMIZATION_LEVEL_HIGH);
+    {   // "profile implicitly upgraded": the subgroup capabilities are added as the kernels use them
+        slang::CompilerOptionEntry e{};
+        e.name = slang::CompilerOptionName::DisableWarning;
+        e.value.kind = slang::CompilerOptionValueKind::String;
+        e.value.stringValue0 = "41012";
+        opts.push_back(e);
+    }
     td.compilerOptionEntries = opts.data();
     td.compilerOptionEntryCount = (uint32_t)opts.size();
     slang::SessionDesc sd{};
