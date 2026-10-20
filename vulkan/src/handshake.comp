@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_KHR_memory_scope_semantics : require
+// The host's turn inside one command buffer (run_graph_seg, the SSD-streaming handshake): publish "segment `seq`
+// reached", then wait until the host answers with >= seq. Measured on the M1 Max under Asahi (honeykrisp-strata
+// bench/vkprobe): ~6 us a handshake against ~100 us for a submit or a timeline semaphore per segment, host writes made
+// during the wait are visible to the dispatches after it, and 50 ms waits trip no watchdog.
+// Bounded: after max_iter polls the wait gives up and counts it in flags[2] (the host then stops with an error).
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Flags { uint v[]; };   // [0] gpu->host, [1] host->gpu, [2] timeouts
+layout(push_constant, std430) uniform P { Flags flags; uint seq; uint max_iter; } p;
+
+void main() {
+    atomicStore(p.flags.v[0], p.seq, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+    uint n = 0u;
+    while (atomicLoad(p.flags.v[1], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible) < p.seq) {
+        if (++n >= p.max_iter) {
+            atomicAdd(p.flags.v[2], 1u, gl_ScopeQueueFamily, 0, 0);
+            break;
+        }
+    }
+}

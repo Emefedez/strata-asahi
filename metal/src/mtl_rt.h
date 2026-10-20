@@ -46,9 +46,10 @@ struct Arg {           // one argument of a dispatch: a buffer (+ offset) or inl
     const Buffer* buf = nullptr;
     size_t off = 0;
     std::vector<uint8_t> bytes;
+    uint32_t align = 8;   // inline bytes' alignment: the Vulkan build packs arguments in C layout (Metal ignores it)
     static Arg B(const Buffer& b, size_t off = 0) { Arg a; a.buf = &b; a.off = off; return a; }
     template <class T> static Arg V(const T& v) {
-        Arg a; a.bytes.resize(sizeof(T)); std::memcpy(a.bytes.data(), &v, sizeof(T)); return a;
+        Arg a; a.bytes.resize(sizeof(T)); std::memcpy(a.bytes.data(), &v, sizeof(T)); a.align = alignof(T); return a;
     }
 };
 
