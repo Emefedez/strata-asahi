@@ -552,6 +552,8 @@ double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector
     const uint32_t base = m.seq;
     // ~4 s of polling before a wait gives up; the host's turn (SSD reads for one layer) takes milliseconds
     const uint32_t max_iter = 100u * 1000u * 1000u;
+    static const bool timing = std::getenv("STRATA_VK_TIMING") != nullptr;
+    const double te0 = now_s();
     VkCommandBuffer cb = m.begin();
     size_t i = 0;
     for (size_t s = 0; s <= cuts.size(); ++s) {
@@ -573,15 +575,29 @@ double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector
     }
     const double t0 = now_s();
     VkFence f = m.submit(cb);
+    const double ts0 = now_s();
+    double t_wait = 0, t_host = 0;
     for (size_t s = 0; s < cuts.size(); ++s) {
         const uint32_t want = base + (uint32_t)s + 1;
-        while (__atomic_load_n(&fl[0], __ATOMIC_ACQUIRE) < want) {
-            if (vkGetFenceStatus(m.dev, f) == VK_SUCCESS) break;   // finished early (a timeout): reported below
-        }
+        const double w0 = now_s();
+        // spin on the flag; the fence (a syscall) only every 4096 polls, to notice a GPU that finished early
+        for (uint32_t it = 0; __atomic_load_n(&fl[0], __ATOMIC_ACQUIRE) < want; ++it)
+            if ((it & 4095u) == 4095u && vkGetFenceStatus(m.dev, f) == VK_SUCCESS) break;   // a timeout: reported below
+        const double w1 = now_s();
         at_cut(user, (int)s);
         __atomic_store_n(&fl[1], want, __ATOMIC_RELEASE);
+        t_wait += w1 - w0;
+        t_host += now_s() - w1;
     }
+    const double tf0 = now_s();
     m.finish(cb, f);
+    if (timing) {
+        static int n = 0;
+        if (++n % 16 == 0)
+            std::fprintf(stderr, "mtl(vulkan) timing: %zu dispatches, %zu cuts: encode %.2f ms, submit %.2f, GPU waits %.2f, "
+                                 "host turns %.2f, tail %.2f ms\n", ds.size(), cuts.size(), (t0 - te0) * 1e3, (ts0 - t0) * 1e3,
+                         t_wait * 1e3, t_host * 1e3, (now_s() - tf0) * 1e3);
+    }
     m.seq = base + (uint32_t)cuts.size();
     if (const uint32_t to = __atomic_exchange_n(&fl[2], 0u, __ATOMIC_ACQ_REL)) {
         std::fprintf(stderr, "mtl(vulkan): %u host turns took longer than the GPU waits for (results are not valid)\n", to);

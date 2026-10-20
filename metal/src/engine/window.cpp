@@ -1029,10 +1029,19 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         {
             static const int kt = std::getenv("STRATA_METAL_KPROF") ? std::atoi(std::getenv("STRATA_METAL_KPROF")) : 0;
             static int seen = 0;
-            if (kt == Tn && head && ++seen == 20 && !stream_) kprof(c.ds, Tn);
+            // (streaming: STRATA_METAL_KPROF_STREAM=1 too - the experts are whatever the slots hold; timing only)
+            static const bool ks = std::getenv("STRATA_METAL_KPROF_STREAM") != nullptr;
+            if (kt == Tn && head && ++seen == 20 && (!stream_ || ks)) kprof(c.ds, Tn);
         }
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
+        static const bool vkt = std::getenv("STRATA_VK_TIMING") != nullptr;
+        if (vkt) {
+            static int n = 0;
+            if (++n % 16 == 0)
+                std::fprintf(stderr, "window timing T=%d: pre %.2f ms, patch %.2f, run_ds %.2f (GPU %.2f)\n", Tn,
+                             tp_pre_ - t0, r0 - tp_pre_, tp_rg_, last_gpu_ms_);
+        }
         return finish(Tn, tokens, pos0, head, out, t0);
     }
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
@@ -1904,6 +1913,7 @@ bool Window::mtp_draft(int Tn, const int32_t* tokens, int64_t p, int a, int max_
     int n = 0;
     int32_t tok = tokens[a];
     if (chain_ && max_steps > 0) {
+        const double tq0 = now_ms();
         std::vector<mtl::Dispatch> ds;
         nb_ = false;
         if (a > 0) mtp_encode(ds, R_, 0, a, tokens, p, false);
@@ -1913,7 +1923,20 @@ bool Window::mtp_draft(int Tn, const int32_t* tokens, int64_t p, int a, int max_
             mtp_encode(ds, mR_, 0, 1, nullptr, p + a + j, true, 0, j);
             mtp_pick(ds, j, j + 1 < max_steps);
         }
-        cx_->run_graph(ds);
+        const double tq1 = now_ms();
+        const double gq = 1000.0 * cx_->run_graph(ds);
+        static const bool vkt = std::getenv("STRATA_VK_TIMING") != nullptr;
+        if (vkt) {
+            static int nq = 0;
+            if (++nq % 8 == 0)
+                std::fprintf(stderr, "draft timing: a %d, steps %d: encode %.2f ms, run_graph %.2f ms (GPU %.2f), %zu dispatches\n",
+                             a, max_steps, tq1 - tq0, now_ms() - tq1, gq, ds.size());
+        }
+        {   // STRATA_METAL_KPROF_DRAFT=1 (test tooling): once, the 20th draft round's kernel classes alone
+            static const bool kd = std::getenv("STRATA_METAL_KPROF_DRAFT") != nullptr;
+            static int seen = 0;
+            if (kd && ++seen == 20) kprof(ds, 100 + max_steps);
+        }
         for (int j = 0; j < max_steps; ++j) {
             const float pj = dprob_.as<float>()[j];
             drafts[j] = dout_.as<int32_t>()[j];

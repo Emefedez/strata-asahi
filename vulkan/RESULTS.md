@@ -104,3 +104,60 @@ and why:
 - The Mac's numbers (upstream's `docs/MAC.md`: 7.9 tok/s decode on a 32 GB M4 mini) are not comparable yet: there is
   no end-to-end run on Linux.
 - The dense GEMV's ceiling of 186 GB/s is a sum of the probe's numbers, not a measurement.
+
+## The engine end to end (2026-10-21)
+
+`build-vulkan/strata` (`cmake -S vulkan -B build-vulkan -DSTRATA_ENABLE_VULKAN=ON -DSTRATA_GGML_DIR=<llama.cpp at the
+pinned commit>`), Q2_0, the experts streamed from the SSD (`STRATA_METAL_STREAM=1`), the prompt through decode windows
+(`STRATA_METAL_PROMPT_GEMM=0`: the prompt kernels are not ported yet), greedy.  A short question: "The capital of
+France is Paris."  A story prompt (28 tokens), 120 tokens generated:
+
+| | arena | decode |
+|---|---|---|
+| no MTP | 4 GB | 8.56 tok/s (hit rate 0.71, 283 MB from the SSD a token) |
+| no MTP | 8 GB | 10.49 tok/s (0.84, 201 MB) |
+| no MTP, the handshake's fence polled every 4096 spins (not every spin) | 8 GB | **11.63 tok/s** |
+| `--mtp`, `--spec 2` | 8 GB | 9.12 tok/s (68% of drafts accepted, 1.67 tokens a round) |
+| `--mtp`, `--spec 2 --spec-sched cost` | 8 GB | 10.03 tok/s (87.5% of the verified drafts accepted) |
+| `--mtp`, `--spec 3 --spec-sched cost` | 8 GB | 8.30 tok/s |
+
+The tokens are the same in every run.  Upstream's Mac number for this M1 Max under macOS (docs/MAC.md) is 7.9 tok/s;
+the prompts differ, so it is not a like-for-like comparison yet.  The least MemAvailable in any run: 8.2 GB.
+
+### Where a token's time goes (STRATA_VK_TIMING, STRATA_METAL_KPROF=T with STRATA_METAL_KPROF_STREAM=1)
+
+| a window of | GPU between the 48 handshakes | the host's turns (SSD) | tail (head, sample) |
+|---|---|---|---|
+| 1 token | 39.5 ms | 22-25 ms | 3.1 ms |
+| 2 tokens | 63.5 ms | 37-62 ms | 5.0 ms |
+
+The GPU time of a 1-token window is 42 ms for ~3.5 GB of weights (~83 GB/s): the experts 11 ms (moe_gu 7.0, moe_down
+4.0), the hyper-connection reads ~8 ms, the LM head 2.8 ms (Q5_K, 437 MB, 156 GB/s), GDN 2.4, QSA 1.8, ~40 small
+dense GEMV classes the rest.  The draft round (MTP layer + draft head) is 3.0 ms of GPU and 0.07 ms of encoding.
+
+**Why speculation does not pay yet:** the second token of a window costs 60% of a token on the GPU and more on the
+SSD.  The dense GEMVs (the lane kernels of gemv.slang) grow almost linearly with the window: their cost is the
+activation loads (64 bytes per 16 weights, per token) and the per-token arithmetic, not the weights.  `mma_parity
+--bench` (the LM head, Q5_K): lane 2.61 / 6.36 / 13.55 ms for 1 / 3 / 8 tokens; the matrix-unit GEMV (mma.slang,
+8x8x8 cooperative matrices) 12.8 ms flat - flat as it should be, but 34 GB/s.  `STRATA_METAL_GEMV_NR=2` (two rows a
+lane share each x load) does not change the 2-token window's GPU time.  MoE grows only 25% for twice the experts (at
+one token it leaves the GPU idle).
+
+### What to do next, for speculation
+
+1. A matrix-unit GEMV that is fast at 1-4 tokens (the weights decoded once, the window on the 8x8 tiles): today's
+   mma.slang decodes in one simdgroup per 8 rows with wave barriers between; at 34 GB/s it only breaks even at 8
+   tokens.  Using it for every window size keeps the outputs identical with and without MTP (it is bitwise the same
+   for 1, 3 and 8 tokens, `mma_parity`), not identical to the lane GEMV's.
+2. The hyper-connection reads (`gr_down_q8`, 1.6 -> 3.5 ms a class for the second token): the same x-traffic problem.
+3. The SSD for the draft rows: a rejected draft's experts are read too (+14-37 ms of host turns at 2 tokens).
+4. `--spec-sched cost` (DraftPolicy::choose_mtp): works as designed (a draft is verified when its calibrated
+   acceptance pays for the measured cost of the wider window; costs measured in the first, cold rounds are
+   re-measured after 40 rounds); it will pay as soon as 1-3 make the wider window cheap.
+
+### Measurement artifacts to know
+
+The first window of each size compiles its pipeline specialisations (0.5-1.7 s on Asahi); `STRATA_METAL_PROFILE`'s
+averages and `mtp ... ms/round drafting` include it (the "41 ms of patch+finish" and the "15-24 ms a draft round" of
+the first profiles were this).  `STRATA_METAL_SKIP` changes the routing (empty kernels feed the router garbage), so
+its tok/s mixes the GPU time with the SSD's; the per-window GPU time is the number to read.

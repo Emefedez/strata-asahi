@@ -2,6 +2,8 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -21,6 +23,8 @@ constexpr int kProbes = 3;       // a lookup window size is tried this often bef
 // A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
 // one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
 constexpr double kStaleRounds = 300.0;
+// --spec-sched: the MTP window sizes are re-measured this often (when a round's drafts make the size worth trying)
+constexpr double kSchedStale = 40.0;
 
 }  // namespace
 
@@ -122,8 +126,18 @@ int DraftPolicy::choose_mtp(const float* dprob, int n_drafts) const {
         e += cum;
         const double r = e / cost_ms(k + 1);
         if (r > best * (1.0 + margin_)) { best = r; best_t = k + 1; }
-        // a size whose cost is only guessed is tried a few times when its drafts look likely to hold
-        if (cum >= 0.5 && (cost_n_[k + 1] < kProbes || stale(k + 1))) probe = k + 1;
+        // a size whose cost is only guessed, or was measured long ago (the first rounds run while the arena is still
+        // cold: their costs are high and, priced out, would never be measured again), is tried when its drafts look
+        // likely to hold
+        if (cum >= 0.5 && (cost_n_[k + 1] < kProbes || rounds_ - last_[k + 1] > kSchedStale)) probe = k + 1;
+    }
+    static const bool dbg = std::getenv("STRATA_SPEC_SCHED_DEBUG") != nullptr;
+    if (dbg) {
+        std::fprintf(stderr, "spec-sched: drafts %d p", n_drafts);
+        for (int k = 0; k < n_drafts; ++k) std::fprintf(stderr, " %.2f(c %.2f)", dprob[k], accept_rate(dprob[k]));
+        std::fprintf(stderr, " | cost");
+        for (int t = 1; t <= n_drafts + 1; ++t) std::fprintf(stderr, " %d:%.1f/%d", t, cost_ms(t), (int) cost_n_[t]);
+        std::fprintf(stderr, " -> best %d probe %d\n", best_t, probe);
     }
     return std::max(best_t, probe);
 }
