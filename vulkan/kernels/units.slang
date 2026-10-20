@@ -133,7 +133,7 @@ void bytes2(uint w, inout float q[MAXU], int o) {
 void Dec_run<let F : int>(uint8_t* row, int u, inout float q[MAXU], out float4 sc) {
     if (F == T_Q2_0) {
         uint8_t* b = row + (u >> 2) * 18;
-        // the unit's two halfwords as one 2 x 16-bit load (2-byte aligned): Mesa issues two narrow loads otherwise
+        // the unit's two halfwords as one 4-byte read (the codes sit at +2 of the block: the read is 2-byte aligned)
         const uint16_t2 ac = loadAligned<2>((uint16_t2*)(b + 2 + 4 * (u & 3)));
         const uint a = uint(ac.x), c = uint(ac.y);
         [ForceUnroll]
@@ -145,8 +145,8 @@ void Dec_run<let F : int>(uint8_t* row, int u, inout float q[MAXU], out float4 s
         sc = float4(d, d, d, 0.0f);
     } else if (F == T_Q2_0R) {   // Q2_0 with raw x: q = c - 1, one scale
         uint8_t* b = row + (u >> 2) * 18;
-        uint16_t* p = (uint16_t*)(b + 2 + 4 * (u & 3));
-        const uint a = uint(p[0]), c = uint(p[1]);
+        const uint16_t2 ac = loadAligned<2>((uint16_t2*)(b + 2 + 4 * (u & 3)));
+        const uint a = uint(ac.x), c = uint(ac.y);
         [ForceUnroll]
         for (int j = 0; j < 8; ++j) {
             q[j] = float((a >> (2 * j)) & 3u) - 1.0f;
@@ -199,18 +199,26 @@ void Dec_run<let F : int>(uint8_t* row, int u, inout float q[MAXU], out float4 s
     } else if (F == T_Q3_K) {
         uint8_t* b = row + (u >> 3) * 110;
         const int n = (u >> 2) & 1, j = u & 3;
-        uint16_t* qv = (uint16_t*)(b + 32 + 32 * n);   // odd blocks are only 2-aligned: ushort reads
-        uint16_t* hv = (uint16_t*)b;
         uint8_t* s = b + 96;
         const int i1 = 8 * n + 2 * j, i2 = i1 + 1;
-        const int l1 = int(i1 < 8 ? uint(s[i1]) & 0xFu : uint(s[i1 - 8]) >> 4) | int(((uint(s[8 + (i1 & 3)]) >> (2 * (i1 >> 2))) & 3u) << 4);
-        const int l2 = int(i2 < 8 ? uint(s[i2]) & 0xFu : uint(s[i2 - 8]) >> 4) | int(((uint(s[8 + (i2 & 3)]) >> (2 * (i2 >> 2))) & 3u) << 4);
+        const int l1 = int(i1 < 8 ? uint(s[i1]) & 0xFu : uint(s[i1 - 8]) >> 4) |
+                       int(((uint(s[8 + (i1 & 3)]) >> (2 * (i1 >> 2))) & 3u) << 4);
+        const int l2 = int(i2 < 8 ? uint(s[i2]) & 0xFu : uint(s[i2 - 8]) >> 4) |
+                       int(((uint(s[8 + (i2 & 3)]) >> (2 * (i2 >> 2))) & 3u) << 4);
         const float d = rdh(b + 108);
         const int hs = 4 * n + j;
+        uint16_t* qv = (uint16_t*)(b + 32 + 32 * n);   // the codes: sixteen 16-bit words, read four at a time
+        uint16_t* hv = (uint16_t*)b;                    // the high bits: sixteen 16-bit words
         [ForceUnroll]
-        for (int w = 0; w < 8; ++w) {
-            bytes2(((uint(qv[w]) >> (2 * j)) & 0x0303u) | (((uint(hv[w]) >> hs) & 0x0101u) << 2), q, 2 * w);
-            bytes2(((uint(qv[w + 8]) >> (2 * j)) & 0x0303u) | (((uint(hv[w + 8]) >> hs) & 0x0101u) << 2), q, 16 + 2 * w);
+        for (int w = 0; w < 4; ++w) {
+            const uint16_t2 q0 = loadAligned<2>((uint16_t2*)(qv + 2 * w));      // the unit's first half
+            const uint16_t2 q1 = loadAligned<2>((uint16_t2*)(qv + 2 * w + 8));  // its second half
+            const uint16_t2 h0 = loadAligned<2>((uint16_t2*)(hv + 2 * w));
+            const uint16_t2 h1 = loadAligned<2>((uint16_t2*)(hv + 2 * w + 8));
+            bytes2(((uint(q0.x) >> (2 * j)) & 0x0303u) | (((uint(h0.x) >> hs) & 0x0101u) << 2), q, 4 * w);
+            bytes2(((uint(q0.y) >> (2 * j)) & 0x0303u) | (((uint(h0.y) >> hs) & 0x0101u) << 2), q, 4 * w + 2);
+            bytes2(((uint(q1.x) >> (2 * j)) & 0x0303u) | (((uint(h1.x) >> hs) & 0x0101u) << 2), q, 16 + 4 * w);
+            bytes2(((uint(q1.y) >> (2 * j)) & 0x0303u) | (((uint(h1.y) >> hs) & 0x0101u) << 2), q, 16 + 4 * w + 2);
         }
         const float d1 = d * float(l1 - 32), d2 = d * float(l2 - 32);
         sc = float4(d1, d2, 4.0f * d1, 4.0f * d2);

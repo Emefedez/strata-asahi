@@ -71,12 +71,23 @@ int f_UNIT(int F) {
     }
 }
 
-// Blocks start at 2-byte aligned addresses (18, 66, 74, 82, 98, 110 bytes): multi-byte fields are read as ushorts.
+// ---- reads -------------------------------------------------------------------------------------------
+// Honeykrisp fetches 8 bytes for a 2-byte load and 4 for a 4-byte load: a narrow load reaches a quarter of the
+// bandwidth (measured on the M1 Max: 70 GB/s for 2-byte loads against 290 GB/s for 4-byte and 16-byte loads -
+// honeykrisp-strata's bench/bw_width).  The bulk of a block is therefore read with 4-byte loads.
+//
+// A 4-byte load may sit at any 2-byte aligned address (the blocks start at 2-byte aligned addresses and their
+// sizes are not multiples of 4), so a 16-bit array is read two words at a time (rd2x2).  A field at an odd offset
+// (the i-quant sign and scale bytes) is read a byte at a time: there are a few of them a block, and reading them
+// as words costs more in arithmetic than it saves.
 uint rd16(uint8_t* p) { return uint(*(uint16_t*)p); }
-uint rd32(uint8_t* p) {
-    uint16_t* s = (uint16_t*)p;
-    return uint(s[0]) | (uint(s[1]) << 16);
+uint rd8(uint8_t* p) { return uint(*(uint8_t*)p); }
+// the two 16-bit words of a 16-bit array at p[i] and p[i+1], read as one 4-byte load (the array is 2-byte aligned)
+uint rd2x2(uint16_t* p, int i) {
+    const uint16_t2 v = loadAligned<2>((uint16_t2*)(p + i));
+    return uint(v.x) | (uint(v.y) << 16);
 }
+// the block's fp16 scale: one 2-byte read a block, so it stays narrow
 float rdh(uint8_t* p) { return float(*(half*)p); }
 
 // ---- threadgroup tables ---------------------------------------------------------------------------------------
@@ -143,10 +154,11 @@ void put_signed4(inout float q[MAXU], int o, uint g, uint s) {
 float iq4_lo(uint w) { return f16tof32(w & 0xFFFFu); }
 float iq4_hi(uint w) { return f16tof32(w >> 16); }
 
+// The unit decoders: return s, fill q[UNIT] (ui = unit index inside the block).
 float deq<let F : int>(uint8_t* b, int ui, inout float q[MAXU]) {
     if (F == T_Q2_0) {   // 64 = 4 units of 16; code c (2 bits, LSB first) -> c - 1; scale d
-        uint16_t* p = (uint16_t*)(b + 2 + 4 * ui);
-        const uint a = uint(p[0]), c = uint(p[1]);
+        const uint16_t2 ac = loadAligned<2>((uint16_t2*)(b + 2 + 4 * ui));
+        const uint a = uint(ac.x), c = uint(ac.y);
         [ForceUnroll]
         for (int j = 0; j < 8; ++j) {
             q[j] = float((a >> (2 * j)) & 3u) - 1.0f;
@@ -155,19 +167,22 @@ float deq<let F : int>(uint8_t* b, int ui, inout float q[MAXU]) {
         return rdh(b);
     } else if (F == T_IQ3_XXS) {   // 256 = 8 x 32; unit = half of a 32 (two grid pairs)
         const int ib = ui >> 1, h = ui & 1;
-        const uint aux = rd32(b + 2 + 64 + 4 * ib);
-        uint8_t* qs = b + 2 + 8 * ib + 4 * h;
+        uint16_t* ap = (uint16_t*)(b + 2 + 64 + 4 * ib);
+        const uint aux = rd2x2(ap, 0);
+        uint8_t* qp = b + 2 + 8 * ib + 4 * h;
+        const uint qs = rd2x2((uint16_t*)qp, 0);
         [ForceUnroll]
         for (int l2 = 0; l2 < 2; ++l2) {
             const int l = 2 * h + l2;
             const uint s = ksg((aux >> (7 * l)) & 127u);
-            put_signed4(q, 8 * l2, g_iq3xxs(uint(qs[2 * l2])), s);
-            put_signed4(q, 8 * l2 + 4, g_iq3xxs(uint(qs[2 * l2 + 1])), s >> 4);
+            put_signed4(q, 8 * l2, g_iq3xxs((qs >> (8 * 2 * l2)) & 255u), s);
+            put_signed4(q, 8 * l2 + 4, g_iq3xxs((qs >> (8 * (2 * l2 + 1))) & 255u), s >> 4);
         }
         return rdh(b) * (0.5f + float(aux >> 28)) * 0.5f;
     } else if (F == T_IQ2_XXS) {   // per 32: two u32 (4 grid indices, then 4 x 7 sign bits + 4-bit scale)
         const int ib = ui >> 1, h = ui & 1;
-        const uint a0 = rd32(b + 2 + 8 * ib), a1 = rd32(b + 2 + 8 * ib + 4);
+        uint16_t* ap = (uint16_t*)(b + 2 + 8 * ib);
+        const uint a0 = rd2x2(ap, 0), a1 = rd2x2(ap, 2);
         [ForceUnroll]
         for (int l2 = 0; l2 < 2; ++l2) {
             const int l = 2 * h + l2;
@@ -179,28 +194,32 @@ float deq<let F : int>(uint8_t* b, int ui, inout float q[MAXU]) {
         return rdh(b) * (0.5f + float(a1 >> 28)) * 0.25f;
     } else if (F == T_IQ2_XS) {   // uint16 qs[32] (9-bit grid index + 7-bit sign index), scales[8] nibbles
         const int ib = ui >> 1, h = ui & 1;
-        uint16_t* qs = (uint16_t*)(b + 2);
+        // the two grid indices of a unit are read together (four bytes)
+        uint16_t* qp = (uint16_t*)(b + 2);
+        const uint v2 = rd2x2(qp, 4 * ib + 2 * h);
         [ForceUnroll]
         for (int l2 = 0; l2 < 2; ++l2) {
-            const uint v = uint(qs[4 * ib + 2 * h + l2]);
+            const uint v = (v2 >> (16 * l2)) & 0xFFFFu;
             const uint idx = v & 511u, s = ksg(v >> 9);
             put_signed4(q, 8 * l2, g_iq2xs(idx, 0), s);
             put_signed4(q, 8 * l2 + 4, g_iq2xs(idx, 1), s >> 4);
         }
-        const uint sc = uint(b[66 + ib]);
+        const uint sc = rd8(b + 66 + ib);
         return rdh(b) * (0.5f + float((sc >> (4 * h)) & 15u)) * 0.25f;
     } else if (F == T_IQ2_S) {   // qs[32] low 8 bits of the 10-bit index, signs[32], qh[8], scales[8]
         const int ib = ui >> 1, h = ui & 1;
-        const uint qh = uint(b[66 + ib]);
+        const uint qh = rd8(b + 66 + ib);
+        uint8_t* qp = b + 2 + 4 * ib;
+        uint8_t* sp = b + 34 + 4 * ib;
         [ForceUnroll]
         for (int l2 = 0; l2 < 2; ++l2) {
             const int l = 2 * h + l2;
-            const uint idx = uint(b[2 + 4 * ib + l]) | ((qh << (8 - 2 * l)) & 0x300u);
-            const uint s = uint(b[2 + 32 + 4 * ib + l]);
+            const uint idx = uint(qp[l]) | ((qh << (8 - 2 * l)) & 0x300u);
+            const uint s = uint(sp[l]);
             put_signed4(q, 8 * l2, g_iq2s(idx, 0), s);
             put_signed4(q, 8 * l2 + 4, g_iq2s(idx, 1), s >> 4);
         }
-        const uint sc = uint(b[74 + ib]);
+        const uint sc = rd8(b + 74 + ib);
         return rdh(b) * (0.5f + float((sc >> (4 * h)) & 15u)) * 0.25f;
     } else if (F == T_IQ3_S) {   // qs[64] low 8 bits of 9-bit indices, qh[8], signs[32], scales[4]
         const int ib = ui >> 1, h = ui & 1;
@@ -217,52 +236,72 @@ float deq<let F : int>(uint8_t* b, int ui, inout float q[MAXU]) {
         const uint sc = uint(b[106 + (ib >> 1)]);
         return rdh(b) * float(1 + 2 * int((sc >> (4 * (ib & 1))) & 15u));
     } else if (F == T_IQ4_NL || F == T_IQ4_XS) {   // low nibbles are elements 0..15, high 16..31
-        uint16_t* p = (uint16_t*)(F == T_IQ4_NL ? b + 2 : b + 8 + 16 * ui);
+        uint16_t* p = (uint16_t*)(b + (F == T_IQ4_NL ? 2 : 8 + 16 * ui));
         [ForceUnroll]
-        for (int j = 0; j < 8; ++j) {
-            const uint v = uint(p[j]);
-            const uint w0 = t_iq4[v & 255u], w1 = t_iq4[v >> 8];
+        for (int j = 0; j < 8; j += 2) {
+            const uint w = rd2x2(p, j);
+            const uint v0 = w & 0xFFFFu, v1 = w >> 16;
+            const uint w0 = t_iq4[v0 & 255u], w1 = t_iq4[v0 >> 8];
+            const uint w2 = t_iq4[v1 & 255u], w3 = t_iq4[v1 >> 8];
             q[2 * j] = iq4_lo(w0);
             q[2 * j + 16] = iq4_hi(w0);
             q[2 * j + 1] = iq4_lo(w1);
             q[2 * j + 17] = iq4_hi(w1);
+            q[2 * j + 2] = iq4_lo(w2);
+            q[2 * j + 18] = iq4_hi(w2);
+            q[2 * j + 3] = iq4_lo(w3);
+            q[2 * j + 19] = iq4_hi(w3);
         }
         if (F == T_IQ4_NL) return rdh(b);
         const uint sh = rd16(b + 2);
-        const int ls = int((uint(b[4 + (ui >> 1)]) >> (4 * (ui & 1))) & 15u) | int(((sh >> (2 * ui)) & 3u) << 4);
+        const int ls = int((rd8(b + 4 + (ui >> 1)) >> (4 * (ui & 1))) & 15u) | int(((sh >> (2 * ui)) & 3u) << 4);
         return rdh(b) * float(ls - 32);
     } else if (F == T_Q8_0) {
         uint16_t* p = (uint16_t*)(b + 2);
         [ForceUnroll]
-        for (int j = 0; j < 16; ++j) {
-            const uint v = uint(p[j]);
-            q[2 * j] = float(int(v << 24) >> 24);
-            q[2 * j + 1] = float(int(v << 16) >> 24);
+        for (int j = 0; j < 16; j += 2) {
+            const uint w = rd2x2(p, j);
+            const uint v0 = w & 0xFFFFu, v1 = w >> 16;
+            q[2 * j] = float(int(v0 << 24) >> 24);
+            q[2 * j + 1] = float(int(v0 << 16) >> 24);
+            q[2 * j + 2] = float(int(v1 << 24) >> 24);
+            q[2 * j + 3] = float(int(v1 << 16) >> 24);
         }
         return rdh(b);
     } else if (F == T_Q4_0) {
         uint16_t* p = (uint16_t*)(b + 2);
         [ForceUnroll]
-        for (int j = 0; j < 8; ++j) {
-            const uint v = uint(p[j]);
-            q[2 * j] = float(v & 15u) - 8.0f;
-            q[2 * j + 16] = float((v >> 4) & 15u) - 8.0f;
-            q[2 * j + 1] = float((v >> 8) & 15u) - 8.0f;
-            q[2 * j + 17] = float(v >> 12) - 8.0f;
+        for (int j = 0; j < 8; j += 2) {
+            const uint w = rd2x2(p, j);
+            const uint v0 = w & 0xFFFFu, v1 = w >> 16;
+            q[2 * j] = float(v0 & 15u) - 8.0f;
+            q[2 * j + 16] = float((v0 >> 4) & 15u) - 8.0f;
+            q[2 * j + 1] = float((v0 >> 8) & 15u) - 8.0f;
+            q[2 * j + 17] = float(v0 >> 12) - 8.0f;
+            q[2 * j + 2] = float(v1 & 15u) - 8.0f;
+            q[2 * j + 18] = float((v1 >> 4) & 15u) - 8.0f;
+            q[2 * j + 3] = float((v1 >> 8) & 15u) - 8.0f;
+            q[2 * j + 19] = float(v1 >> 12) - 8.0f;
         }
         return rdh(b);
     } else if (F == T_Q5_0 || F == T_Q5_1) {   // Q5_1: the 5-bit code (no offset; the min goes through the x sums)
-        const uint hb = rd32(b + (F == T_Q5_0 ? 2 : 4));
+        uint16_t* hp = (uint16_t*)(b + (F == T_Q5_0 ? 2 : 4));
+        const uint hb = rd2x2(hp, 0);
         uint16_t* p = (uint16_t*)(b + (F == T_Q5_0 ? 6 : 8));
         const float off = F == T_Q5_0 ? 16.0f : 0.0f;
         [ForceUnroll]
-        for (int j = 0; j < 8; ++j) {
-            const uint v = uint(p[j]);
-            const int j0 = 2 * j, j1 = 2 * j + 1;
-            q[j0] = float(int(v & 15u) | int(((hb >> j0) & 1u) << 4)) - off;
-            q[j0 + 16] = float(int((v >> 4) & 15u) | int(((hb >> (j0 + 16)) & 1u) << 4)) - off;
-            q[j1] = float(int((v >> 8) & 15u) | int(((hb >> j1) & 1u) << 4)) - off;
-            q[j1 + 16] = float(int(v >> 12) | int(((hb >> (j1 + 16)) & 1u) << 4)) - off;
+        for (int j = 0; j < 8; j += 2) {
+            const uint w = rd2x2(p, j);
+            const uint v0 = w & 0xFFFFu, v1 = w >> 16;
+            [ForceUnroll]
+            for (int k = 0; k < 2; ++k) {
+                const uint v = k == 0 ? v0 : v1;
+                const int j0 = 2 * j + 2 * k, j1 = 2 * j + 2 * k + 1;
+                q[j0] = float(int(v & 15u) | int(((hb >> j0) & 1u) << 4)) - off;
+                q[j0 + 16] = float(int((v >> 4) & 15u) | int(((hb >> (j0 + 16)) & 1u) << 4)) - off;
+                q[j1] = float(int((v >> 8) & 15u) | int(((hb >> j1) & 1u) << 4)) - off;
+                q[j1 + 16] = float(int(v >> 12) | int(((hb >> (j1 + 16)) & 1u) << 4)) - off;
+            }
         }
         return rdh(b);
     }
