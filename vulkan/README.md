@@ -76,6 +76,22 @@ macOS (docs/MAC.md) is 7.9 tok/s of decode, but with a different prompt, so the 
 calibrated chance of acceptance pays for the measured cost of the wider window. The idea comes from DeepSeek's
 DeepInfer.
 
+## Trying the prompt path
+
+The prompt kernels are ported but off by default (`STRATA_METAL_PROMPT_GEMM=0` in the run config). To try them:
+
+1. Update the checkout that serves the model: in lmdeck, Backends → Update Strata (or `lmdeck strata install`). It
+   fast-forwards the checkout and rebuilds; the kernels are compiled from `vulkan/kernels/` when the engine starts.
+2. In the run config (`strata-q2_0.json` in the install folder; keep a copy), delete `"STRATA_METAL_PROMPT_GEMM": "0"`
+   from `env`.
+3. Close large GPU users, do not compile or suspend, load the model, and send a prompt of a few thousand tokens.
+   The engine log (`strata-q2_0.log`) prints `prompt N tokens = ... read in X ms (Y tok/s)`: compare it with the
+   decode-window path (~10 tok/s), and compare the answer with the same prompt with the line put back.
+4. To go back, restore the line (or the copy).
+
+Chunk size: `STRATA_METAL_PROMPT_CHUNK` (default 1024 rows while streaming); shorter prompts than
+`STRATA_METAL_PROMPT_GEMM_MIN` (64) stay on the decode-window path.
+
 ## Not done yet
 
 - An end-to-end run of the prompt path (`STRATA_METAL_PROMPT_GEMM` unset) on the real model: its kernels pass parity,
