@@ -247,6 +247,50 @@ void Dec_run<let F : int>(uint8_t* row, int u, inout float q[MAXU], out float4 s
     }
 }
 
+// unit_combine's dot without the prepared slice in registers: x is read a float4 at a time from the unit's two
+// halves and fed to the same four accumulators in the same order, so the result is bitwise unit_combine(X_load(..)).
+// A window of tokens then holds the decoded unit and one float4 of x, not 32 x values a token: the 2-token GEMV of
+// X_load + unit_combine needed 255 registers and spilled (AGX_MESA_DEBUG=shaderdb), 1 token 119-167.
+float unit_dot<let F : int>(float* xp, float* s16, int u, float q[MAXU], float4 sc) {
+    const int UNIT = f_UNIT(F), H = UNIT / 2;
+    int o0, o1;
+    float xs0 = 0.0f, xs1 = 0.0f;
+    if (F == T_Q2_0) {
+        o0 = 16 * u; o1 = o0 + 8;
+        xs0 = s16[u];
+    } else if (F == T_Q4_K || F == T_Q5_K) {
+        o0 = 256 * (u >> 3) + 64 * ((u >> 1) & 3) + 16 * (u & 1); o1 = o0 + 32;
+        xs0 = s16[o0 >> 4]; xs1 = s16[(o0 >> 4) + 2];
+    } else if (F == T_Q6_K) {
+        o0 = 256 * (u >> 3) + 128 * ((u >> 2) & 1) + 32 * (u & 1) + 16 * ((u >> 1) & 1); o1 = o0 + 64;
+        xs0 = s16[o0 >> 4]; xs1 = s16[(o0 >> 4) + 4];
+    } else if (F == T_Q3_K) {
+        o0 = 32 * u; o1 = o0 + 16;
+        xs0 = s16[2 * u]; xs1 = s16[2 * u + 1];
+    } else {
+        o0 = UNIT * u; o1 = o0 + H;   // (Q5_1: its sums are formed from the raw x below)
+    }
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0, a = 0, b = 0;
+    [unroll]
+    for (int j = 0; j < H; j += 4) {
+        const float4 x0 = loadAligned<16>((float4*)(xp + o0 + j)), x1 = loadAligned<16>((float4*)(xp + o1 + j));
+        s0 = fma(q[j], x0.x, s0);
+        s1 = fma(q[j + 1], x0.y, s1);
+        s2 = fma(q[H + j], x1.x, s2);
+        s3 = fma(q[H + j + 1], x1.y, s3);
+        s0 = fma(q[j + 2], x0.z, s0);
+        s1 = fma(q[j + 3], x0.w, s1);
+        s2 = fma(q[H + j + 2], x1.z, s2);
+        s3 = fma(q[H + j + 3], x1.w, s3);
+        if (F == T_Q5_1) {
+            a += x0.x; a += x0.y; a += x0.z; a += x0.w;
+            b += x1.x; b += x1.y; b += x1.z; b += x1.w;
+        }
+    }
+    if (F == T_Q5_1) { xs0 = a; xs1 = b; }
+    return sc.x * (s0 + s1) + sc.y * (s2 + s3) - (sc.z * xs0 + sc.w * xs1);
+}
+
 // acc += unit dot of decoded q / sc with one token's prepared slice
 float unit_combine(int UNIT, float q[MAXU], float4 sc, float xs[MAXU], float xsum[2]) {
     const int H = UNIT / 2;

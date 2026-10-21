@@ -27,7 +27,11 @@ struct GemvPush {
 // 2 = tokens past the first skip the combine, 4 = no x loads, 5 = no weight loads or decode (all wrong values)
 [vk::constant_id(9)] const int GEMV_PROBE = 0;
 
-groupshared float g_red[256];   // K-split partials: KS * RS * RG * NR * 8 <= 128 floats for every shape below
+// function constant 10 (GEMV_XS): the window's x read through unit_dot (a float4 at a time, bitwise the same sums)
+// instead of X_load's 32-value slice a token (default; 0: the slices, as the MSL)
+[vk::constant_id(10)] const bool GEMV_XS = true;
+
+groupshared float g_red[256];
 
 void gemv<let F : int, let LPR : int, let NR : int, let SG : int, let KS : int>(GemvPush pc, uint3 tg, uint tid) {
     const int UNIT = f_UNIT(F), RS = SG / KS, RG = 32 / LPR;
@@ -50,7 +54,16 @@ void gemv<let F : int, let LPR : int, let NR : int, let SG : int, let KS : int>(
     [ForceUnroll]
     for (int r = 0; r < NR; ++r) rp[r] = pc.W + uint64_t(min(row0 + r, int(a.n_out) - 1)) * a.row_bytes;
     const int s16n = int(a.n_in) / 16;
-    if (GEMV_PROBE == 3) {
+    if (GEMV_XS && GEMV_PROBE == 0) {
+        for (int u = u0 + li; u < u1; u += LPR) {
+            float q[NR][MAXU];
+            float4 sc[NR];
+            [ForceUnroll] for (int r = 0; r < NR; ++r) Dec_run<F>(rp[r], u, q[r], sc[r]);
+            for (int t = 0; t < NTOK; ++t)
+                [ForceUnroll] for (int r = 0; r < NR; ++r)
+                    acc[r][t] += unit_dot<F>(pc.xp + t * int(a.x_stride), pc.s16 + t * s16n, u, q[r], sc[r]);
+        }
+    } else if (GEMV_PROBE == 3) {
         // rows outer, tokens inner: one row's decoded unit in registers at a time
         for (int u = u0 + li; u < u1; u += LPR)
             [ForceUnroll]
