@@ -667,8 +667,16 @@ double Context::run_graph(const std::vector<Dispatch>& ds) {
     return now_s() - t0;
 }
 
+// The host's turns between the parts of a window (the SSD-streaming handshake, one per layer).  By default every part
+// is its own submission: the GPU is idle while the host reads the experts, so the desktop's compositor gets it (a
+// window held the GPU for 80-300 ms - seconds when the CPU was busy - and the screen froze; suspending then left the
+// GPU firmware crashed, 2026-10-21).  Each part costs a submit + fence wait (85-115 us measured, ~5 ms a window).
+// STRATA_VK_SPIN=1: the parts in ONE command buffer, the GPU spinning on a host-written flag at each cut
+// (handshake.comp, ~6 us a cut) - faster, but the GPU is not shared while it waits.
 double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
                               void* user) {
+    static const bool spin = [] { const char* e = std::getenv("STRATA_VK_SPIN"); return e && std::atoi(e) != 0; }();
+    if (!spin) return run_graph_parts(ds, cuts, at_cut, user);
     Impl& m = *impl_;
     auto* fl = static_cast<uint32_t*>(m.flags.ptr);
     const uint32_t base = m.seq;
@@ -724,6 +732,61 @@ double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector
     if (const uint32_t to = __atomic_exchange_n(&fl[2], 0u, __ATOMIC_ACQ_REL)) {
         std::fprintf(stderr, "mtl(vulkan): %u host turns took longer than the GPU waits for (results are not valid)\n", to);
         std::exit(5);
+    }
+    return now_s() - t0;
+}
+
+double Context::run_graph_parts(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
+                                void* user) {
+    Impl& m = *impl_;
+    static const bool timing = std::getenv("STRATA_VK_TIMING") != nullptr;
+    const double te0 = now_s();
+    std::vector<VkCommandBuffer> cbs;
+    size_t i = 0;
+    for (size_t s = 0; s <= cuts.size(); ++s) {
+        const size_t end = s < cuts.size() ? (size_t)cuts[s] : ds.size();
+        VkCommandBuffer cb = m.begin();
+        // the previous parts' writes (earlier submissions on this queue) before this part reads them
+        if (s > 0) Impl::barrier(cb);
+        const size_t first = i;
+        for (; i < end; ++i) {
+            if (i > first && ds[i].barrier) Impl::barrier(cb);
+            m.encode(cb, ds[i]);
+        }
+        VK(vkEndCommandBuffer(cb));
+        cbs.push_back(cb);
+    }
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence f;
+    VK(vkCreateFence(m.dev, &fi, nullptr, &f));
+    const double t0 = now_s();
+    double t_wait = 0, t_host = 0;
+    for (size_t s = 0; s < cbs.size(); ++s) {
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cbs[s];
+        const double w0 = now_s();
+        VK(vkQueueSubmit(m.q, 1, &si, f));
+        const VkResult r = vkWaitForFences(m.dev, 1, &f, VK_TRUE, UINT64_MAX);
+        if (r != VK_SUCCESS) {
+            std::fprintf(stderr, "mtl(vulkan): command buffer failed (%d)\n", r);
+            std::exit(5);
+        }
+        VK(vkResetFences(m.dev, 1, &f));
+        const double w1 = now_s();
+        t_wait += w1 - w0;
+        if (s < cuts.size()) {   // host writes before the next submission are visible to it (coherent memory)
+            at_cut(user, (int)s);
+            t_host += now_s() - w1;
+        }
+    }
+    vkDestroyFence(m.dev, f, nullptr);
+    vkFreeCommandBuffers(m.dev, m.pool, (uint32_t)cbs.size(), cbs.data());
+    if (timing) {
+        static int n = 0;
+        if (++n % 16 == 0)
+            std::fprintf(stderr, "mtl(vulkan) timing (parts): %zu dispatches, %zu cuts: encode %.2f ms, GPU + submits %.2f, "
+                                 "host turns %.2f ms\n", ds.size(), cuts.size(), (t0 - te0) * 1e3, t_wait * 1e3, t_host * 1e3);
     }
     return now_s() - t0;
 }

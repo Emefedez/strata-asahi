@@ -111,6 +111,9 @@ public:
     // missing experts are put in place).  Returns the GPU time in seconds.
     double run_graph_seg(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
                          void* user);
+    // (Vulkan) run_graph_seg with every part its own submission, the GPU idle during the host's turns (the default there)
+    double run_graph_parts(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
+                           void* user);
     // One command buffer per `run_cb` call, empty or not: measures commit+wait round trips.
     double run_wall(const std::vector<Dispatch>& ds, int reps, double* gpu_seconds = nullptr);
 
