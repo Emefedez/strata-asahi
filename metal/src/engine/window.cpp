@@ -1209,8 +1209,17 @@ bool Window::stream_arena(std::string& err) {
     for (int tries = 0;; ++tries) {
         const double planned = budget;
         std::function<uint64_t()> recheck = [&]() -> uint64_t { return (uint64_t) arena_shrink(am, planned, avail_now()); };
-        if (st_->make_arena(*cx_, (uint64_t) budget, prof, pg_on ? 576 : 64, err, minimal ? std::function<uint64_t()>() : recheck,
-                            [&](uint64_t step) { return arena_grow(am, avail_now(), (double) step); }))
+        // min slots: a window of MAXT (8) rows can route MAXT * 10 distinct experts in one layer (64 stopped an 8-row
+        // window with "no free slot" when the fill had stopped early)
+        // the stepped fill's check: on Vulkan the arena's memory is committed when it is allocated (the buffer is
+        // zeroed), so filling it takes nothing more - the check would count the arena itself and stop at 0 GB
+#if defined(STRATA_GPU_VULKAN)
+        auto grow = [&](uint64_t) { return true; };
+#else
+        auto grow = [&](uint64_t step) { return arena_grow(am, avail_now(), (double) step); };
+#endif
+        if (st_->make_arena(*cx_, (uint64_t) budget, prof, pg_on ? 576 : 128, err, minimal ? std::function<uint64_t()>() : recheck,
+                            grow))
             break;
         if (st_->shrink_to() == 0 || tries == 4) return false;
         if ((double) st_->shrink_to() + 64.0 * (1 << 20) >= budget) minimal = true;   // no smaller layout than this one
