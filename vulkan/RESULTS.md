@@ -9,7 +9,7 @@ ports in `vulkan/kernels/`.
 
 ```sh
 # the driver: what a load of each width reaches (honeykrisp-strata's bench)
-cd ~/Work/honeykrisp-strata/bench && make
+cd honeykrisp-strata/bench && make   # https://github.com/Emefedez/honeykrisp-strata
 VK_DRIVER_FILES=$HOME/.local/lib/honeykrisp-strata/v3/share/vulkan/icd.d/asahi_icd.aarch64.json \
   ./build/vkprobe --mib 512 bw_width
 

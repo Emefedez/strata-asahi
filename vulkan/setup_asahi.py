@@ -195,6 +195,13 @@ def main(argv=None) -> int:
     # STRATA_METAL_PROMPT_GEMM=0: prompts through the decode windows until the prompt kernels are ported to Vulkan
     cfg["env"] = {"STRATA_METAL_STREAM": "1" if stream else "0", "VK_DRIVER_FILES": str(icd), "STRATA_METAL_PROMPT_GEMM": "0"}
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    if cfg_path.exists():
+        # a run config edited by hand (or tuned in lmdeck) is not lost
+        import shutil
+        import time
+        bak = cfg_path.with_name(f"{cfg_path.name}.{time.strftime('%Y%m%d-%H%M%S')}.bak")
+        shutil.copy2(cfg_path, bak)
+        S.say(f"the previous run config is kept as {bak.name}")
     S.write_config(cfg_path, cfg)
     S.ok(f"run config: {cfg_path} (lmdeck lists it as strata/{tag.lower()})")
     return 0

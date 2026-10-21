@@ -1,3 +1,6 @@
+> **This is a fork.** Branch `vulkan-asahi` adds a Vulkan engine for Apple GPUs under Asahi Linux: see
+> [vulkan/README.md](vulkan/README.md). Everything else is upstream [Niko1221/Strata](https://github.com/Niko1221/Strata).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
