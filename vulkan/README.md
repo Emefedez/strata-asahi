@@ -14,9 +14,10 @@ stay in memory, and the rest stream from the SSD, the same design as the Mac eng
   unified memory, buffer device addresses for kernel arguments, push constants in the Metal argument layout, one
   pipeline per threadgroup size.
 - `kernels/` holds the Metal kernels rewritten in [Slang](https://shader-slang.org). The decode window is complete:
-  quant, GEMV, MoE, router, GDN, QSA, hyper-connections, sampling and MTP. The prompt kernels (`dense_mm.slang`,
-  `moe_mm.slang`, on cooperative matrices) pass their parity tests but are not wired in yet, so prompts are read
-  through decode windows.
+  quant, GEMV, MoE, router, GDN, QSA, hyper-connections, sampling and MTP. Every prompt-chunk kernel is ported too
+  (`dense_mm`, `moe_mm`, `prompt`, `gdn_prompt`, `qsa_prompt`), and each passes its parity test. The engine's prompt
+  path has not been run end to end on Vulkan yet, so run configs still set `STRATA_METAL_PROMPT_GEMM=0` (prompts
+  through decode windows).
 - The Metal parity tests (`metal/tests/*_parity.cpp`, CPU references as the oracle) build against the Vulkan runtime
   unchanged (`-DSTRATA_VK_TESTS=gemv_parity;...`).
 - Each part of a streamed window is its own submission, so the GPU is free while the host reads experts from the SSD.
@@ -77,8 +78,9 @@ DeepInfer.
 
 ## Not done yet
 
-- The prompt path (`window.cpp` with the ported `dense_mm`/`moe_mm`, plus `prompt.slang`, `gdn_prompt` and
-  `qsa_prompt`).
+- An end-to-end run of the prompt path (`STRATA_METAL_PROMPT_GEMM` unset) on the real model: its kernels pass parity,
+  but the chunked path has not been timed or checked against the decode-window path on Asahi. `metal/tests/prompt_chain`
+  cannot be used for that on a 32 GB machine: it wraps the whole 37 GB GGUF, which on Vulkan becomes a GPU copy.
 - The dense GEMV reaches 163 GB/s, while its weight reads alone reach 322 GB/s. Its loads and arithmetic do not
   overlap yet.
 - Vision input, and any Mac other than the M1 Max, are untested.

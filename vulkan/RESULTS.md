@@ -186,3 +186,20 @@ The story prompt (28 tokens):
 
 The prompt through decode windows went from 7.3 to 9.9 tok/s with the cache (the code prompt's time to the first
 token 22.9 -> 15.8 s).  The recommended decode settings for a 32 GB Mac on Asahi: the last row of both tables.
+
+## The prompt kernels (2026-10-21)
+
+Every prompt-chunk kernel now has a Slang port that passes the Metal parity test it was written against (synthetic
+shapes, the private v3 driver, no model loaded):
+
+| Test | Result |
+|---|---|
+| `dense_mm_parity`, `moe_mm_parity` (v2 tiles) | pass (earlier: 4.2 TFLOP/s dense; expert GEMMs' ceiling 274 tok/s) |
+| `prompt_parity` | route_topk 0 id mismatches over 300 tokens; HC read as GEMMs within 2.4e-4 (fused fp16 path 3.1e-4); swiglu_h 4.8e-4, moe_out 1.2e-7 |
+| `gdn_prompt_parity` | every scan variant and the chunked form, 1-300 tokens: y within 3.2e-7, state 2.1e-7, conv history exact |
+| `qsa_prompt_parity` | qsa_score_mm 2.7e-6; qsa_attn_mm 1.7e-4 and qsa_flash 2.7e-4 against qsa_attn + merge (pos 0 and 30000) |
+
+On Vulkan the engine takes the v2 expert GEMMs and the v1 QSA path (qsa_attn + qsa_merge, from the decode port):
+`coop_k4()` answers false. qsa_attn_mm and qsa_flash are plain SIMT ports with the matrix units' fp16 roundings,
+for the parity test. Not measured yet: the chunked prompt path end to end (its speed, and its answers against the
+decode-window path).
