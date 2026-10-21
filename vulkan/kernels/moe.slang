@@ -189,12 +189,12 @@ void gu_body<let F : int, let LPR : int, let NR : int, let NE : int>(uint8_t* g0
         [ForceUnroll]
         for (int t = 0; t < NE; ++t) {
             const int tok = etok[t];
-            float xs[MAXU], xsum[2];
-            X_load<F>(x + tok * int(a.n_embd), xs16 + tok * int(a.n_embd / 16), u, xs, xsum);
+            float* xt = x + tok * int(a.n_embd);
+            float* st = xs16 + tok * int(a.n_embd / 16);
             [ForceUnroll]
             for (int r = 0; r < NR; ++r) {
-                ag[r][t] += unit_combine(UNIT, qg[r], cg[r], xs, xsum);
-                au[r][t] += unit_combine(UNIT, qu[r], cu[r], xs, xsum);
+                ag[r][t] += unit_dot<F>(xt, st, u, qg[r], cg[r]);
+                au[r][t] += unit_dot<F>(xt, st, u, qu[r], cu[r]);
             }
         }
     }
@@ -271,11 +271,9 @@ void dn_body<let F : int, let LPR : int, let NR : int, let NE : int>(uint8_t* d0
         float4 sc[NR];
         [ForceUnroll] for (int r = 0; r < NR; ++r) Dec_run<F>(d0 + r * a.d_row, u, q[r], sc[r]);
         [ForceUnroll]
-        for (int t = 0; t < NE; ++t) {
-            float xs[MAXU], xsum[2];
-            X_load<F>(h + (c + t) * int(a.n_ff), hs16 + (c + t) * int(a.n_ff / 16), u, xs, xsum);
-            [ForceUnroll] for (int r = 0; r < NR; ++r) ac[r][t] += unit_combine(UNIT, q[r], sc[r], xs, xsum);
-        }
+        for (int t = 0; t < NE; ++t)
+            [ForceUnroll] for (int r = 0; r < NR; ++r)
+                ac[r][t] += unit_dot<F>(h + (c + t) * int(a.n_ff), hs16 + (c + t) * int(a.n_ff / 16), u, q[r], sc[r]);
     }
     [ForceUnroll]
     for (int r = 0; r < NR; ++r)

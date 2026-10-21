@@ -19,6 +19,7 @@
 
 #include <slang-com-ptr.h>
 #include <slang.h>
+#include <slang-tag-version.h>
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
@@ -27,7 +28,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <unistd.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -73,9 +76,10 @@ constexpr uint32_t kSpecWgX = 100, kSpecWgY = 101, kSpecWgZ = 102, kSpecTgWords 
 
 struct BufImpl {
     VkBuffer buf = VK_NULL_HANDLE;
-    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;   // VK_NULL_HANDLE: a view into another allocation (wrap of its memory)
     VkDeviceAddress addr = 0;
     size_t bytes = 0;
+    VkDeviceSize base = 0;                 // a view's offset in buf (indirect dispatches)
 };
 
 struct PipeImpl {
@@ -105,7 +109,17 @@ struct Context::Impl {
     std::string name;
     Slang::ComPtr<slang::IGlobalSession> gs;
     Slang::ComPtr<slang::ISession> session;
-    std::vector<Slang::ComPtr<slang::IModule>> libs;
+    std::vector<Slang::ComPtr<slang::IModule>> libs;   // made on demand (module())
+    std::vector<std::string> lib_src, lib_last;
+    std::vector<uint64_t> lib_key;
+    std::mutex smu;
+    std::map<std::pair<int, std::string>, VkShaderModule> mods;   // one module per (library, entry point)
+    slang::IModule* module(int lib);
+    VkShaderModule shader(int lib, const std::string& fn);
+    // the allocations by CPU address: wrap() of memory inside one is a view, not a copy (a prompt's buffers alias a
+    // region of the expert arena)
+    std::mutex amu;
+    std::map<uintptr_t, BufImpl*> by_ptr;
     // run_graph_seg's handshake
     PipeImpl* hs = nullptr;
     Buffer flags;
@@ -174,7 +188,7 @@ struct Context::Impl {
         o = align_up(o, 4);
         if (o) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)o, pc);
         if (d.indirect)
-            vkCmdDispatchIndirect(cb, BI(*d.indirect)->buf, d.ind_off);
+            vkCmdDispatchIndirect(cb, BI(*d.indirect)->buf, BI(*d.indirect)->base + d.ind_off);
         else
             vkCmdDispatch(cb, d.grid[0], d.grid[1], d.grid[2]);
         return;
@@ -397,11 +411,35 @@ bool Context::supports_metal4() const { return false; }
 uint64_t Context::recommended_working_set() const { return impl_->heap_size; }
 uint64_t Context::max_buffer_length() const { return impl_->heap_size; }
 
+// SPIR-V of every entry point is cached on disk (STRATA_VK_SPV_CACHE, default ~/.cache/strata-vulkan; "0" = off),
+// keyed by the library's whole source - the prelude and the shared headers included - and the entry point: Slang's
+// code generation is 10-650 ms an entry point, and a window of a new size used to pay it for ~60 kernels again
+// (2-3 s; the function constants are Vulkan specialization constants, so one module serves every value).
+namespace {
+uint64_t fnv1a(const std::string& s, uint64_t h = 1469598103934665603ull) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+std::string spv_cache_dir() {
+    const char* e = std::getenv("STRATA_VK_SPV_CACHE");
+    if (e && std::string(e) == "0") return "";
+    if (e && *e) return e;
+    const char* x = std::getenv("XDG_CACHE_HOME");
+    const char* h = std::getenv("HOME");
+    if (x && *x) return std::string(x) + "/strata-vulkan";
+    return h ? std::string(h) + "/.cache/strata-vulkan" : "";
+}
+}  // namespace
+
 int Context::compile(const std::vector<std::string>& files, const std::string& prelude, bool) {
     // The callers name the .metal files of the Metal tree; the Slang ports carry the same names (an absolute path,
-    // the engine's own kernels, maps to kernel_dir/engine/<name>).
+    // the engine's own kernels, maps to kernel_dir/engine/<name>).  The Slang module is made on the first entry point
+    // the SPIR-V cache does not have.
     std::string src = prelude + "\n#include \"strata_prelude.slang\"\n";
-    if (prelude.find("NO_GGML_COMMON") == std::string::npos) src += "#include \"ggml_common.slang\"\n";
+    const bool ggml = prelude.find("NO_GGML_COMMON") == std::string::npos;
+    if (ggml) src += "#include \"ggml_common.slang\"\n";
+    std::string key = std::string(SLANG_TAG_VERSION) + "\n" + read_file(kernel_dir + "/strata_prelude.slang") +
+                      (ggml ? read_file(kernel_dir + "/ggml_common.slang") : std::string());
     std::string last;
     for (const auto& f : files) {
         std::string base = f.substr(f.rfind('/') == std::string::npos ? 0 : f.rfind('/') + 1);
@@ -410,41 +448,91 @@ int Context::compile(const std::vector<std::string>& files, const std::string& p
         src += "#line 1 \"" + base + "\"\n" + read_file(p) + "\n";
         last = base;
     }
-    const std::string name = "lib" + std::to_string(impl_->libs.size());
-    Slang::ComPtr<slang::IBlob> diag;
-    slang::IModule* mod = impl_->session->loadModuleFromSourceString(name.c_str(), (name + ".slang").c_str(), src.c_str(), diag.writeRef());
-    if (!mod) {
-        std::fprintf(stderr, "mtl(vulkan): compile failed (%s; %s):\n%s\n", impl_->name.c_str(), last.c_str(),
-                     diag ? (const char*)diag->getBufferPointer() : "");
-        std::exit(3);
-    }
-    impl_->libs.push_back(Slang::ComPtr<slang::IModule>(mod));
+    impl_->libs.push_back(Slang::ComPtr<slang::IModule>());
+    impl_->lib_src.push_back(src);
+    impl_->lib_last.push_back(last);
+    impl_->lib_key.push_back(fnv1a(key + src));
     return (int)impl_->libs.size() - 1;
 }
 
+slang::IModule* Context::Impl::module(int lib) {
+    if (!libs.at(lib)) {
+        const std::string nm = "lib" + std::to_string(lib);
+        Slang::ComPtr<slang::IBlob> diag;
+        slang::IModule* mod = session->loadModuleFromSourceString(nm.c_str(), (nm + ".slang").c_str(), lib_src[lib].c_str(),
+                                                                  diag.writeRef());
+        if (!mod) {
+            std::fprintf(stderr, "mtl(vulkan): compile failed (%s; %s):\n%s\n", name.c_str(), lib_last[lib].c_str(),
+                         diag ? (const char*)diag->getBufferPointer() : "");
+            std::exit(3);
+        }
+        libs[lib] = Slang::ComPtr<slang::IModule>(mod);
+    }
+    return libs[lib].get();
+}
+
+VkShaderModule Context::Impl::shader(int lib, const std::string& fn) {
+    std::lock_guard<std::mutex> g(smu);
+    const auto k = std::make_pair(lib, fn);
+    if (auto it = mods.find(k); it != mods.end()) return it->second;
+    static const std::string dir = spv_cache_dir();
+    char hx[24];
+    std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long)fnv1a(fn, lib_key[lib]));
+    const std::string path = dir.empty() ? "" : dir + "/" + hx + ".spv";
+    std::vector<uint32_t> spv;
+    if (!path.empty()) {
+        std::ifstream f(path, std::ios::binary);
+        if (f) {
+            f.seekg(0, std::ios::end);
+            const size_t n = (size_t)f.tellg();
+            f.seekg(0);
+            spv.resize(n / 4);
+            if (n % 4 != 0 || !f.read((char*)spv.data(), (std::streamsize)n)) spv.clear();
+        }
+    }
+    if (spv.empty()) {
+        slang::IModule* mod = module(lib);
+        Slang::ComPtr<slang::IEntryPoint> ep;
+        if (SLANG_FAILED(mod->findEntryPointByName(fn.c_str(), ep.writeRef()))) {
+            std::fprintf(stderr, "mtl(vulkan): no function %s\n", fn.c_str());
+            std::exit(3);
+        }
+        slang::IComponentType* parts[] = {mod, ep.get()};
+        Slang::ComPtr<slang::IComponentType> composite, linked;
+        Slang::ComPtr<slang::IBlob> diag, code;
+        if (SLANG_FAILED(session->createCompositeComponentType(parts, 2, composite.writeRef(), diag.writeRef())) ||
+            SLANG_FAILED(composite->link(linked.writeRef(), diag.writeRef())) ||
+            SLANG_FAILED(linked->getEntryPointCode(0, 0, code.writeRef(), diag.writeRef()))) {
+            std::fprintf(stderr, "mtl(vulkan): pipeline %s:\n%s\n", fn.c_str(), diag ? (const char*)diag->getBufferPointer() : "");
+            std::exit(3);
+        }
+        spv.assign((const uint32_t*)code->getBufferPointer(), (const uint32_t*)code->getBufferPointer() + code->getBufferSize() / 4);
+        if (!path.empty()) {   // written whole under a temporary name, then renamed: a reader never sees half a file
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            const std::string tmp = path + ".tmp" + std::to_string((long)getpid());
+            std::ofstream o(tmp, std::ios::binary);
+            o.write((const char*)spv.data(), (std::streamsize)(spv.size() * 4));
+            o.close();
+            if (o) std::filesystem::rename(tmp, path, ec);
+            else std::filesystem::remove(tmp, ec);
+        }
+    }
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = spv.size() * 4;
+    smi.pCode = spv.data();
+    VkShaderModule m;
+    VK(vkCreateShaderModule(dev, &smi, nullptr, &m));
+    mods.emplace(k, m);
+    return m;
+}
+
 Pipeline Context::pipeline(int lib, const std::string& fn, const Constants& c) {
-    slang::IModule* mod = impl_->libs.at(lib).get();
-    Slang::ComPtr<slang::IEntryPoint> ep;
-    if (SLANG_FAILED(mod->findEntryPointByName(fn.c_str(), ep.writeRef()))) {
-        std::fprintf(stderr, "mtl(vulkan): no function %s\n", fn.c_str());
-        std::exit(3);
-    }
-    slang::IComponentType* parts[] = {mod, ep.get()};
-    Slang::ComPtr<slang::IComponentType> composite, linked;
-    Slang::ComPtr<slang::IBlob> diag, code;
-    if (SLANG_FAILED(impl_->session->createCompositeComponentType(parts, 2, composite.writeRef(), diag.writeRef())) ||
-        SLANG_FAILED(composite->link(linked.writeRef(), diag.writeRef())) ||
-        SLANG_FAILED(linked->getEntryPointCode(0, 0, code.writeRef(), diag.writeRef()))) {
-        std::fprintf(stderr, "mtl(vulkan): pipeline %s:\n%s\n", fn.c_str(), diag ? (const char*)diag->getBufferPointer() : "");
-        std::exit(3);
-    }
+    VkShaderModule sm = impl_->shader(lib, fn);
     auto* p = new PipeImpl;
     p->fn = fn;
     p->consts = c.vals;
-    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = code->getBufferSize();
-    smi.pCode = static_cast<const uint32_t*>(code->getBufferPointer());
-    VK(vkCreateShaderModule(impl_->dev, &smi, nullptr, &p->mod));
+    p->mod = sm;
     Pipeline r;
     r.handle = p;
     r.max_threads = (int)impl_->props.limits.maxComputeWorkGroupInvocations;
@@ -492,6 +580,10 @@ Buffer Context::alloc(size_t bytes) {
     ai.buffer = b->buf;
     b->addr = vkGetBufferDeviceAddress(impl_->dev, &ai);
     allocated_ += b->bytes;
+    {
+        std::lock_guard<std::mutex> g(impl_->amu);
+        impl_->by_ptr[(uintptr_t)ptr] = b;
+    }
     Buffer out;
     out.handle = b;
     out.ptr = ptr;
@@ -503,6 +595,27 @@ Buffer Context::alloc(size_t bytes) {
 // import), so a wrap is a GPU allocation filled with a copy. Buffer::ptr is then the allocation's CPU view, not `p`:
 // callers that keep writing to `p` afterwards must write to the buffer instead (the Vulkan engine's arena does).
 Buffer Context::wrap(void* p, size_t bytes) {
+    {   // memory of an allocation of this context: a view (the same VkBuffer, its address + the offset)
+        std::lock_guard<std::mutex> g(impl_->amu);
+        auto it = impl_->by_ptr.upper_bound((uintptr_t)p);
+        if (it != impl_->by_ptr.begin()) {
+            --it;
+            BufImpl* par = it->second;
+            const uintptr_t off = (uintptr_t)p - it->first;
+            if (off + bytes <= par->bytes) {
+                auto* v = new BufImpl;
+                v->buf = par->buf;
+                v->addr = par->addr + off;
+                v->bytes = bytes;
+                v->base = par->base + off;
+                Buffer out;
+                out.handle = v;
+                out.ptr = p;
+                out.bytes = bytes;
+                return out;
+            }
+        }
+    }
     Buffer b = alloc(bytes);
     std::memcpy(b.ptr, p, bytes);
     return b;
@@ -510,7 +623,16 @@ Buffer Context::wrap(void* p, size_t bytes) {
 Buffer Context::wrap(void* p, size_t bytes, size_t) { return wrap(p, bytes); }
 
 void Context::free(Buffer& b) {
+    if (auto* bi = BI(b); bi && bi->mem == VK_NULL_HANDLE) {   // a view: the allocation stays
+        delete bi;
+        b = Buffer{};
+        return;
+    }
     if (auto* bi = BI(b)) {
+        {
+            std::lock_guard<std::mutex> g(impl_->amu);
+            impl_->by_ptr.erase((uintptr_t)b.ptr);
+        }
         vkDeviceWaitIdle(impl_->dev);
         vkDestroyBuffer(impl_->dev, bi->buf, nullptr);
         vkFreeMemory(impl_->dev, bi->mem, nullptr);

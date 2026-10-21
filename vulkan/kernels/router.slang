@@ -36,11 +36,7 @@ void router_route<let F : int>(RouterPush pc, uint tgx, uint ngx, uint tid) {
         float q[MAXU];
         float4 sc;
         Dec_run<F>(rp, u, q, sc);
-        for (int t = 0; t < NTOK; ++t) {
-            float xs[MAXU], xsum[2];
-            X_load<F>(pc.xp + t * int(ga.x_stride), pc.s16 + t * s16n, u, xs, xsum);
-            acc[t] += unit_combine(UNIT, q, sc, xs, xsum);
-        }
+        for (int t = 0; t < NTOK; ++t) acc[t] += unit_dot<F>(pc.xp + t * int(ga.x_stride), pc.s16 + t * s16n, u, q, sc);
     }
     for (int t = 0; t < NTOK; ++t) {
         const float v = lane_sum<32>(acc[t]);

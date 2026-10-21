@@ -62,11 +62,8 @@ void grd_acc<let F : int>(uint8_t* w, int nin, int ks, int KS, int lane, float* 
         float q[MAXU];
         float4 sc;
         Dec_run<F>(w, u, q, sc);
-        for (int t = 0; t < GR_NTOK; ++t) {
-            float xs[MAXU], xsum[2] = {0.0f, 0.0f};
-            [unroll] for (int k = 0; k < f_UNIT(F); k += 16) load16(xn + t * nin + UNIT * u + k, xs, k);
-            acc[t] += unit_combine(UNIT, q, sc, xs, xsum);
-        }
+        // (unit_dot: the raw x of a contiguous unit, bitwise load16 + unit_combine without the slice in registers)
+        for (int t = 0; t < GR_NTOK; ++t) acc[t] += unit_dot<F>(xn + t * nin, xn, u, q, sc);
     }
 }
 
@@ -140,11 +137,7 @@ void gr_up_f<let F : int>(GrUpPush pc, uint3 tg, uint tid) {
         float q[MAXU];
         float4 sc;
         Dec_run<F>(w, u, q, sc);
-        for (int t = 0; t < GR_NTOK; ++t) {
-            float xs[MAXU], xsum[2] = {0.0f, 0.0f};
-            [unroll] for (int k = 0; k < f_UNIT(F); k += 16) load16(pc.lo + t * int(a.hc_lr) + UNIT * u + k, xs, k);
-            acc[t] += unit_combine(UNIT, q, sc, xs, xsum);
-        }
+        for (int t = 0; t < GR_NTOK; ++t) acc[t] += unit_dot<F>(pc.lo + t * int(a.hc_lr), pc.lo, u, q, sc);
     }
     for (int t = 0; t < GR_NTOK; ++t) {
         const float v = lane_sum<4>(acc[t]);
