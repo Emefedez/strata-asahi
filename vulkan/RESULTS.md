@@ -161,3 +161,28 @@ The first window of each size compiles its pipeline specialisations (0.5-1.7 s o
 averages and `mtp ... ms/round drafting` include it (the "41 ms of patch+finish" and the "15-24 ms a draft round" of
 the first profiles were this).  `STRATA_METAL_SKIP` changes the routing (empty kernels feed the router garbage), so
 its tok/s mixes the GPU time with the SSD's; the per-window GPU time is the number to read.
+
+## Speculation, with the kernels compiled once (2026-10-21, after the SPIR-V cache)
+
+The first window of every size used to compile ~60 kernels (2-3 s, Slang's code generation per specialization),
+which had made every wider window look slow.  With one SPIR-V module per entry point and the disk cache, warm runs
+(Q2_0, experts streamed, arena 8 GB, greedy, 150 tokens; the tokens are the same in every row of a table):
+
+A code rewrite (the prompt asks for a 14-line Python function back with type hints; 132 prompt tokens):
+
+| | tokens a round | decode |
+|---|---|---|
+| no drafts | 1.00 | 9.50 tok/s |
+| `--spec 8 --suffix-draft 3` (prompt lookup) | 2.14 (91% of drafts accepted) | 11.19 tok/s |
+| `--spec 8 --suffix-draft 3 --mtp <dir> --mtp-max-t 2 --spec-sched cost` | 3.43 (97%) | **11.54 tok/s (+21%)** |
+
+The story prompt (28 tokens):
+
+| | tokens a round | decode |
+|---|---|---|
+| no drafts | 1.00 | 12.94 tok/s |
+| `--spec 8 --suffix-draft 3` | 1.00 (nothing to look up) | 12.59 tok/s |
+| `--spec 8 --suffix-draft 3 --mtp <dir> --mtp-max-t 2 --spec-sched cost` | 1.32 (80%) | **13.34 tok/s** |
+
+The prompt through decode windows went from 7.3 to 9.9 tok/s with the cache (the code prompt's time to the first
+token 22.9 -> 15.8 s).  The recommended decode settings for a 32 GB Mac on Asahi: the last row of both tables.
