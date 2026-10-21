@@ -1169,6 +1169,16 @@ bool Window::stream_arena(std::string& err) {
     const double keep = arena_keep(am);
     const double avail = am.available;
     double budget = arena_budget(am);
+    // STRATA_VK_ARENA_BYTES (a launcher's plan, lmdeck): at most that many bytes; the budget's own memory checks stay
+    // (STRATA_METAL_ARENA_GB sets the arena outright instead)
+    if (const char* e = std::getenv("STRATA_VK_ARENA_BYTES"); e && am.arena_gb < 0) {
+        const double cap = std::atof(e);
+        if (cap > 0 && cap < budget) {
+            std::fprintf(stderr, "strata metal stream: the arena capped at %.2f GB (STRATA_VK_ARENA_BYTES; the budget was %.2f GB)\n",
+                         cap / gb, budget / gb);
+            budget = std::max(1.0 * gb, cap);
+        }
+    }
     if (budget < 2 * gb) {
         std::fprintf(stderr, "strata metal stream: only %.1f GB left for the expert arena (the GPU working set %.1f GB, RAM %.1f GB, "
                              "%.1f GB allocated): expect a low hit rate\n", budget / gb, cx_->recommended_working_set() / gb,

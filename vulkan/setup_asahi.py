@@ -83,6 +83,7 @@ def main(argv=None) -> int:
     ap.add_argument("--source", choices=S.SOURCES, default=None)
     ap.add_argument("--no-start", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--no-mtp", action="store_true", help="no MTP draft layer (it is ~5 GB to download and 0.9 GB of memory)")
     a = ap.parse_args(argv)
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
@@ -169,20 +170,51 @@ def main(argv=None) -> int:
     stream = M.streams(model, info["ram_gb"])
     rt = data / "mtp" / "rt"
     if stream:
-        S.ok("the experts stream from the SSD (no MTP draft layer: one token per step is faster when streaming)")
+        S.ok("the experts stream from the SSD")
         M.experts_file(files[0])
+    # The MTP draft layer, also when the experts stream: on Asahi a draft is verified only when its measured
+    # acceptance pays for the wider window (--spec-sched cost; vulkan/RESULTS.md: +21% on a code rewrite, +3% on a
+    # story, the same tokens)
+    use_mtp = not a.no_mtp
+    if use_mtp and not (rt.parent / "mtp-q2_0.gguf").exists():
+        S.say("  The MTP draft layer (speculative decoding) comes from the original Qwen checkpoint: only its ~5 GB of MTP tensors are downloaded.")
+        S.fetch_mtp(rt.parent, env)
+        S.run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(rt.parent), "--experts", "q2_0",
+               "--out", str(rt.parent / "mtp-q2_0.gguf")], env=env)
+    if use_mtp:
+        rt.mkdir(parents=True, exist_ok=True)   # the engine reads mtp-q2_0.gguf beside it
+        S.refresh_draft_vocab(rt, "cjk")
+        S.ok(f"MTP draft layer: {rt.parent / 'mtp-q2_0.gguf'}")
 
     # ---- 7. the run config
     S.step(7, "writing the run config")
     port = a.port or 8080
-    cfg = M.mac_config(EXE, M.engine_args(pack, files, rt, ctx, stream, info["ram_gb"]), pack,
+    cfg = M.mac_config(EXE, vk_args(M.engine_args(pack, files, rt, ctx, stream, info["ram_gb"]), rt, use_mtp), pack,
                        f"{fam['name']}-{model.lower()}", tag, port)
     cfg["backend"] = "vulkan"
-    cfg["env"] = {"STRATA_METAL_STREAM": "1" if stream else "0", "VK_DRIVER_FILES": str(icd)}
+    # STRATA_METAL_PROMPT_GEMM=0: prompts through the decode windows until the prompt kernels are ported to Vulkan
+    cfg["env"] = {"STRATA_METAL_STREAM": "1" if stream else "0", "VK_DRIVER_FILES": str(icd), "STRATA_METAL_PROMPT_GEMM": "0"}
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
     S.write_config(cfg_path, cfg)
     S.ok(f"run config: {cfg_path} (lmdeck lists it as strata/{tag.lower()})")
     return 0
+
+
+def vk_args(args: list, rt: Path, use_mtp: bool) -> list:
+    """The Mac's engine arguments with the decode settings measured on Asahi (vulkan/RESULTS.md): windows up to 8
+    tokens for prompt-lookup drafts, the MTP's own windows at 2 tokens, scheduled by expected tokens per ms."""
+    out, i = [], 0
+    drop = {"--spec": 1, "--suffix-draft": 1, "--mtp": 1, "--mtp-max-t": 1, "--spec-sched": 1}
+    while i < len(args):
+        if args[i] in drop:
+            i += 1 + drop[args[i]]
+            continue
+        out.append(args[i])
+        i += 1
+    out += ["--spec", "8", "--suffix-draft", "3"]
+    if use_mtp:
+        out += ["--mtp", str(rt), "--mtp-max-t", "2", "--spec-sched", "cost"]
+    return out
 
 
 if __name__ == "__main__":
