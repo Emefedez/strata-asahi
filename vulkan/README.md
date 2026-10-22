@@ -69,8 +69,10 @@ M1 Max 32 GB, Q2_0, experts streamed, 8 GB arena, greedy decoding. The commands 
 | A story (28 tokens) | 12.9 tok/s | 13.3 tok/s |
 | A code rewrite (132 tokens) | 9.5 tok/s | 11.5 tok/s |
 
-Prompts are read at ~10 tok/s because they still go through decode windows. Upstream's figure for a 32 GB Mac under
-macOS (docs/MAC.md) is 7.9 tok/s of decode, but with a different prompt, so the two are not directly comparable.
+Prompts go through decode windows by default (14.7 tok/s on a 10,609-token prompt, ~13 GB arena). With the chunked prompt path on
+and `STRATA_METAL_PROMPT_CHUNK=2048` they read at 123.8 tok/s (8.4x), or 134.7 tok/s at 4096 (9.2x), with the same
+greedy answer; see [RESULTS.md](RESULTS.md). Upstream's figure for a 32 GB Mac under macOS (docs/MAC.md) is 7.9 tok/s
+of decode, but with a different prompt, so the two are not directly comparable.
 
 `--spec-sched cost` (in `src/spec/draft_policy.cpp`) is an opt-in addition. It verifies an MTP draft only when the
 calibrated chance of acceptance pays for the measured cost of the wider window. The idea comes from DeepSeek's
@@ -78,7 +80,8 @@ DeepInfer.
 
 ## Trying the prompt path
 
-The prompt kernels are ported but off by default (`STRATA_METAL_PROMPT_GEMM=0` in the run config). To try them:
+The prompt kernels are ported and now measured end to end (RESULTS.md: 9.2x on a 10k-token prompt with the same
+answer), but off by default (`STRATA_METAL_PROMPT_GEMM=0` in the run config). To try them:
 
 1. Update the checkout that serves the model: in lmdeck, Backends → Update Strata (or `lmdeck strata install`). It
    fast-forwards the checkout and rebuilds; the kernels are compiled from `vulkan/kernels/` when the engine starts.
@@ -90,13 +93,16 @@ The prompt kernels are ported but off by default (`STRATA_METAL_PROMPT_GEMM=0` i
 4. To go back, restore the line (or the copy).
 
 Chunk size: `STRATA_METAL_PROMPT_CHUNK` (default 1024 rows while streaming); shorter prompts than
-`STRATA_METAL_PROMPT_GEMM_MIN` (64) stay on the decode-window path.
+`STRATA_METAL_PROMPT_GEMM_MIN` (64) stay on the decode-window path. On this 32 GB machine 2048 is the best balance
+(8.4x, 2.55 GB of arena); 4096 is 3% faster and takes 4.46 GB. `STRATA_METAL_TRACE=1` prints a time per chunk.
 
 ## Not done yet
 
-- An end-to-end run of the prompt path (`STRATA_METAL_PROMPT_GEMM` unset) on the real model: its kernels pass parity,
-  but the chunked path has not been timed or checked against the decode-window path on Asahi. `metal/tests/prompt_chain`
-  cannot be used for that on a 32 GB machine: it wraps the whole 37 GB GGUF, which on Vulkan becomes a GPU copy.
+- The prompt path stays off by default: it reached 9.2x on a 10k-token prompt, short of lmdeck's 10x target, and the
+  default chunk for a 32 GB machine is not chosen yet. `metal/tests/prompt_chain` cannot be used for the end-to-end
+  check on 32 GB: it wraps the whole 37 GB GGUF, which on Vulkan becomes a GPU copy.
+- The desktop's share of the GPU during a prompt chunk is not measured (the chunk is submitted per layer, but the
+  longest single part was not timed while the desktop was in use).
 - The dense GEMV reaches 163 GB/s, while its weight reads alone reach 322 GB/s. Its loads and arithmetic do not
   overlap yet.
 - Vision input, and any Mac other than the M1 Max, are untested.

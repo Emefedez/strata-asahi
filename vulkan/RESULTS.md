@@ -201,5 +201,35 @@ shapes, the private v3 driver, no model loaded):
 
 On Vulkan the engine takes the v2 expert GEMMs and the v1 QSA path (qsa_attn + qsa_merge, from the decode port):
 `coop_k4()` answers false. qsa_attn_mm and qsa_flash are plain SIMT ports with the matrix units' fp16 roundings,
-for the parity test. Not measured yet: the chunked prompt path end to end (its speed, and its answers against the
-decode-window path).
+for the parity test.
+
+## The prompt path, end to end (2026-10-22)
+
+The chunked path (`STRATA_METAL_PROMPT_GEMM` unset, `STRATA_METAL_PROMPT_CHUNK` set) on the live model: Q2_0,
+experts streamed, arena ~13.0 GB, greedy, warm SPIR-V cache, the private v3 driver, the desktop running. The prompt
+is 10,609 tokens the engine sees (a ~10k-token synthetic notes file plus lmdeck's system prompt); 163 tokens were
+generated. The same request on the decode-window path (`STRATA_METAL_PROMPT_GEMM=0`) is the reference:
+
+| Prompt path | prompt read | tok/s | speedup | arena held by the chunk buffers |
+|---|---|---|---|---|
+| off (decode windows) | 722.8 s | 14.7 | 1.0x | - |
+| chunk 1024 | 97.3 s | 109.0 | 7.4x | 1.60 GB (1,147 slots) |
+| chunk 2048 | 85.7 s | 123.8 | 8.4x | 2.55 GB (1,832 slots) |
+| chunk 4096 | **78.7 s** | **134.7** | **9.2x** | 4.46 GB (3,203 slots) |
+
+The answers are identical, reasoning and content, over all 163 greedy tokens; decode is unchanged (12.6 tok/s
+without the path, 12.5 tok/s with it, 163 tokens). The log's `file tier I/O this request` counter (the process's
+storage reads since the previous request, `generate.cpp`) falls from 1.33 TB to 102 GB for the 4096 run: the
+decode-window path re-reads the experts for every 8-row window, the chunked path once a chunk.
+
+A 5,594-token prompt shows the same order (14.0 tok/s off; 105.8 / 127.8 / 131.9 tok/s at 1024 / 2048 / 4096).
+
+`STRATA_METAL_TRACE=1` times each chunk (`prompt chunk pos ..., N rows: X ms`). A 1024-row chunk takes 8.6-8.9 s
+and a 2048-row chunk 15.3 s; the last 364-row chunk takes 6.9-7.2 s whatever the chunk size. The fixed ~6-7 s a
+chunk is the pass over the layer's experts that the arena misses, close to the 4 s the plan estimated at 7 GB/s.
+The marginal cost is ~3-5 ms a row, which is why fewer, longer chunks win.
+
+The 4096 chunk is 3% faster than 2048 and holds 1.9 GB more of the arena (the decode cache falls from ~10.4 to
+~8.5 GB), so on a 32 GB machine 2048 is the better balance; 4096 is the fastest prompt on a machine with memory to
+spare. The 10x target in lmdeck's plan is not reached: 9.2x at 10,609 tokens on this machine. The path stays off by
+default until that is settled; lmdeck's run config was left with `STRATA_METAL_PROMPT_GEMM=0`.
